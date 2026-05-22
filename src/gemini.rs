@@ -416,6 +416,7 @@ impl GeminiClient {
                 HeaderValue::from_str(value)?,
             );
         }
+        add_web_required_headers(&mut request_headers);
 
         let inner_string = serde_json::to_string(&inner)?;
         let f_req = serde_json::to_string(&json!([null, inner_string]))?;
@@ -540,6 +541,7 @@ impl GeminiClient {
                 "[1,null,null,null,null,null,null,null,[4]]",
             )
             .header("x-goog-ext-73010989-jspb", "[0]")
+            .header("x-goog-ext-73010990-jspb", "[0]")
             .header("Cookie", session.cookie_header.clone())
             .form(&form)
             .send()
@@ -549,6 +551,75 @@ impl GeminiClient {
         } else {
             Err(anyhow!(
                 "Gemini activity RPC failed with status {}",
+                response.status()
+            ))
+        }
+    }
+
+    async fn send_bard_settings(&self, session: &SessionState) -> anyhow::Result<()> {
+        let keys = [
+            "bard_activity_enabled",
+            "disable_generated_image_download_dialog",
+            "disable_image_upload_tooltip",
+            "gempix_discovery_banner_dismissal_count",
+            "gempix_discovery_banner_last_dismissed",
+            "has_seen_image_grams_discovery_banner",
+            "has_seen_image_preview_in_input_area_tooltip",
+            "has_seen_kallo_discovery_banner",
+            "has_seen_kallo_tooltip",
+            "has_seen_model_tooltip_in_input_area_for_gempix",
+            "upload_disclaimer_last_consent_time_sec",
+            "web_and_app_activity_enabled",
+        ];
+        let reqid = self.reqid.fetch_add(100_000, Ordering::Relaxed);
+        let language = if session.language.is_empty() {
+            "en"
+        } else {
+            &session.language
+        };
+        let mut params = vec![
+            ("rpcids".to_string(), "ESY5D".to_string()),
+            ("hl".to_string(), language.to_string()),
+            ("_reqid".to_string(), reqid.to_string()),
+            ("rt".to_string(), "c".to_string()),
+            ("source-path".to_string(), "/app".to_string()),
+        ];
+        if let Some(build_label) = session.build_label.as_ref() {
+            params.push(("bl".to_string(), build_label.clone()));
+        }
+        if let Some(session_id) = session.session_id.as_ref() {
+            params.push(("f.sid".to_string(), session_id.clone()));
+        }
+        let payload_body = serde_json::to_string(&json!([[keys]]))?;
+        let payload = json!([[["ESY5D", payload_body, null, "generic"]]]).to_string();
+        let form = vec![
+            ("at", session.access_token.as_str()),
+            ("f.req", payload.as_str()),
+        ];
+        let response = self
+            .http
+            .post(ENDPOINT_BATCH_EXEC)
+            .query(&params)
+            .header(
+                CONTENT_TYPE,
+                "application/x-www-form-urlencoded;charset=utf-8",
+            )
+            .header("X-Same-Domain", "1")
+            .header(
+                "x-goog-ext-525001261-jspb",
+                "[1,null,null,null,null,null,null,null,[4]]",
+            )
+            .header("x-goog-ext-73010989-jspb", "[0]")
+            .header("x-goog-ext-73010990-jspb", "[0]")
+            .header("Cookie", session.cookie_header.clone())
+            .form(&form)
+            .send()
+            .await?;
+        if response.status().is_success() {
+            Ok(())
+        } else {
+            Err(anyhow!(
+                "Gemini settings RPC failed with status {}",
                 response.status()
             ))
         }
@@ -690,7 +761,7 @@ impl GeminiClient {
             return Err(anyhow!("Gemini init markers not found"));
         }
 
-        *self.session.lock().await = Some(SessionState {
+        let session = SessionState {
             access_token,
             build_label,
             session_id,
@@ -698,7 +769,14 @@ impl GeminiClient {
             language,
             cookie_header,
             created_at: Instant::now(),
-        });
+        };
+        *self.session.lock().await = Some(session.clone());
+        if let Err(error) = self.send_bard_settings(&session).await {
+            tracing::debug!(?error, "Gemini settings warmup failed");
+        }
+        if let Err(error) = self.send_bard_activity(&session).await {
+            tracing::debug!(?error, "Gemini activity warmup failed");
+        }
         Ok(())
     }
 
@@ -742,11 +820,30 @@ fn model(name: &str, model_id: &str, owned_by: &str) -> GeminiModel {
         "x-goog-ext-525001261-jspb".to_string(),
         format!(r#"[1,null,null,null,"{model_id}",null,null,0,[4],null,null,1]"#),
     );
+    add_web_required_header_map(&mut header);
     GeminiModel {
         model_name: name.to_string(),
         model_header: header,
         owned_by: owned_by.to_string(),
     }
+}
+
+fn add_web_required_header_map(header: &mut HashMap<String, String>) {
+    header
+        .entry("x-goog-ext-73010989-jspb".to_string())
+        .or_insert_with(|| "[0]".to_string());
+    header
+        .entry("x-goog-ext-73010990-jspb".to_string())
+        .or_insert_with(|| "[0]".to_string());
+}
+
+fn add_web_required_headers(headers: &mut HeaderMap) {
+    headers
+        .entry("x-goog-ext-73010989-jspb")
+        .or_insert(HeaderValue::from_static("[0]"));
+    headers
+        .entry("x-goog-ext-73010990-jspb")
+        .or_insert(HeaderValue::from_static("[0]"));
 }
 
 fn extract_output_from_response(raw: &str) -> anyhow::Result<GeminiOutput> {
@@ -959,6 +1056,7 @@ fn extract_runtime_models(raw: &str) -> anyhow::Result<Vec<GeminiModel>> {
                 "x-goog-ext-525001261-jspb".to_string(),
                 model_header(model_id, capacity, capacity_field),
             );
+            add_web_required_header_map(&mut header);
             let owned_by = if status == 1000 {
                 "gemini-web-runtime"
             } else {

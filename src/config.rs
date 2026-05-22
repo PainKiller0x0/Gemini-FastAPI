@@ -129,6 +129,8 @@ pub struct ImageGenerationConfig {
     pub backend: String,
     #[serde(default = "default_image_model")]
     pub model: String,
+    #[serde(default = "default_web_image_model")]
+    pub web_model: String,
     #[serde(default)]
     pub api_key: Option<String>,
     #[serde(default = "default_image_api_key_env")]
@@ -146,6 +148,7 @@ impl Default for ImageGenerationConfig {
         Self {
             backend: default_image_backend(),
             model: default_image_model(),
+            web_model: default_web_image_model(),
             api_key: None,
             api_key_env: default_image_api_key_env(),
             gemini_api_base_url: default_gemini_api_base_url(),
@@ -178,6 +181,10 @@ fn default_image_backend() -> String {
 
 fn default_image_model() -> String {
     "gemini-3.1-flash-image-preview".to_string()
+}
+
+fn default_web_image_model() -> String {
+    "gemini-3.5-flash".to_string()
 }
 
 fn default_image_api_key_env() -> String {

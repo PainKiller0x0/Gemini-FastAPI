@@ -48,8 +48,9 @@ storage:
   retention_days: 14       # Number of days to retain conversations before cleanup
 
 image_generation:
-  backend: "disabled"       # "disabled", "gemini_api", or "imagen_api"
+  backend: "disabled"       # "disabled", "gemini_web", "auto", "gemini_api", or "imagen_api"
   model: "gemini-3.1-flash-image-preview" # Gemini native image model; Imagen example: "imagen-4.0-generate-001"
+  web_model: "gemini-3.5-flash" # Gemini Web chat model used by backend="gemini_web"
   api_key: null             # Prefer null and set GEMINI_API_KEY in the environment
   api_key_env: "GEMINI_API_KEY"
   gemini_api_base_url: "https://generativelanguage.googleapis.com"

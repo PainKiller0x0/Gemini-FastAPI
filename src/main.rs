@@ -14,6 +14,7 @@ use axum::{
     response::{IntoResponse, Response, Sse, sse::Event},
     routing::{get, post},
 };
+use base64::{Engine as _, engine::general_purpose};
 use chrono::Utc;
 use config::Config;
 use gemini::{GeminiImage, GeminiPool};
@@ -262,6 +263,82 @@ async fn save_generated_images(
     Ok(out)
 }
 
+async fn saved_image_to_openai_data(
+    state: &AppState,
+    filename: String,
+    revised_prompt: Option<String>,
+) -> Result<ImageData, ApiError> {
+    let public_base_url = state
+        .config
+        .image_generation
+        .public_base_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.trim_end_matches('/').to_string());
+    let token = image_token(&filename, state.config.server.api_key.as_deref())
+        .map(|token| format!("?token={token}"))
+        .unwrap_or_default();
+    if let Some(base) = public_base_url.as_ref() {
+        return Ok(ImageData {
+            b64_json: None,
+            url: Some(format!("{base}/images/{filename}{token}")),
+            revised_prompt,
+        });
+    }
+    let path = FsPath::new(&state.config.storage.images_path).join(&filename);
+    let bytes = tokio::fs::read(&path)
+        .await
+        .map_err(|error| ApiError::from(anyhow::anyhow!(error)))?;
+    Ok(ImageData {
+        b64_json: Some(general_purpose::STANDARD.encode(bytes)),
+        url: None,
+        revised_prompt,
+    })
+}
+
+async fn generate_web_images(
+    state: &AppState,
+    request: &ImageGenerationRequest,
+) -> Result<Vec<ImageData>, ApiError> {
+    let n = request.n.unwrap_or(1).clamp(1, 4);
+    let prompt = format!(
+        "Generate {n} image(s) for this request. Return the actual generated image(s), not a text-only explanation. Request: {}",
+        request.prompt.trim()
+    );
+    let output = state
+        .gemini
+        .generate_output(&state.config.image_generation.web_model, &prompt, &[])
+        .await
+        .map_err(ApiError::from)?;
+    if output.images.is_empty() {
+        let refusal = output.text.trim();
+        let detail = if refusal.is_empty() {
+            "Gemini Web returned no generated images".to_string()
+        } else {
+            format!("Gemini Web returned no generated images: {refusal}")
+        };
+        return Err(ApiError::from(anyhow::anyhow!(detail)));
+    }
+    let saved = state
+        .gemini
+        .save_images(&output.images, &state.config.storage.images_path)
+        .await
+        .map_err(ApiError::from)?;
+    let mut data = Vec::new();
+    for image in saved {
+        data.push(
+            saved_image_to_openai_data(state, image.filename, Some(request.prompt.clone())).await?,
+        );
+    }
+    if data.is_empty() {
+        return Err(ApiError::from(anyhow::anyhow!(
+            "Gemini Web generated images but they could not be downloaded"
+        )));
+    }
+    Ok(data)
+}
+
 async fn image_generations(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -273,9 +350,34 @@ async fn image_generations(
         .model
         .clone()
         .unwrap_or_else(|| state.config.image_generation.model.clone());
-    match images::generate_images(&state.http, &state.config.image_generation, &request).await {
-        Ok(images) => {
-            let data = save_generated_images(&state, &images).await?;
+    let backend = state.config.image_generation.backend.as_str();
+    let result: Result<Vec<ImageData>, ApiError> = match backend {
+        "gemini_web" | "web" | "free_web" => generate_web_images(&state, &request).await,
+        "auto" => match generate_web_images(&state, &request).await {
+            Ok(data) => Ok(data),
+            Err(web_error) => {
+                match images::generate_images(&state.http, &state.config.image_generation, &request)
+                    .await
+                {
+                    Ok(images) => save_generated_images(&state, &images).await,
+                    Err(api_error) => Err(ApiError::from(anyhow::anyhow!(
+                        "Gemini Web failed first: {}; official API fallback failed: {}",
+                        web_error.detail,
+                        api_error
+                    ))),
+                }
+            }
+        },
+        _ => match images::generate_images(&state.http, &state.config.image_generation, &request)
+            .await
+        {
+            Ok(images) => save_generated_images(&state, &images).await,
+            Err(error) => Err(ApiError::from(error)),
+        },
+    };
+
+    match result {
+        Ok(data) => {
             state.history.append(&HistoryRecord {
                 ts: timestamp(),
                 kind: "images.generations",
@@ -293,7 +395,7 @@ async fn image_generations(
             .into_response())
         }
         Err(error) => {
-            let detail = error.to_string();
+            let detail = error.detail.clone();
             state.history.append(&HistoryRecord {
                 ts: timestamp(),
                 kind: "images.generations",
@@ -304,7 +406,7 @@ async fn image_generations(
                 ok: false,
                 error: Some(&detail),
             });
-            Err(ApiError::from(error))
+            Err(error)
         }
     }
 }
