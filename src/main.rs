@@ -20,7 +20,8 @@ use history::{HistoryRecord, HistoryStore, started, timestamp};
 use openai::{
     AssistantMessage, ChatCompletionRequest, ChatCompletionResponse, Choice, ModelData,
     ModelListResponse, ResponseCreateRequest, StreamChoice, StreamChunk, Usage,
-    chat_extra_instructions, estimate_tokens, messages_to_prompt, response_extra_instructions,
+    chat_extra_instructions, estimate_tokens, messages_to_prompt, process_output,
+    response_extra_instructions, response_input_to_prompt,
 };
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
@@ -168,11 +169,24 @@ async fn chat_completions(
         }
     };
 
+    let processed = process_output(&output);
+    let prompt_tokens = estimate_tokens(&prompt);
+    let completion_tokens = estimate_tokens(&processed.storage_text);
+    let usage = Usage {
+        prompt_tokens,
+        completion_tokens,
+        total_tokens: prompt_tokens + completion_tokens,
+        prompt_tokens_details: Some(json!({"cached_tokens": 0})),
+        completion_tokens_details: Some(json!({"reasoning_tokens": 0})),
+    };
+
     if request.stream.unwrap_or(false) {
         let prompt_tokens = estimate_tokens(&prompt);
-        let completion_tokens = estimate_tokens(&output);
         let id = completion_id.clone();
         let model = model_name.clone();
+        let visible = processed.visible_text.clone().unwrap_or_default();
+        let tool_calls = processed.tool_calls.clone();
+        let finish_reason = processed.finish_reason.clone();
         let s = stream! {
             let role = StreamChunk {
                 id: id.clone(),
@@ -184,21 +198,49 @@ async fn chat_completions(
                     delta: json!({"role": "assistant"}),
                     finish_reason: None,
                 }],
+                usage: None,
             };
             yield Ok::<_, std::convert::Infallible>(Event::default().data(serde_json::to_string(&role).unwrap()));
 
-            let content = StreamChunk {
-                id: id.clone(),
-                object: "chat.completion.chunk",
-                created,
-                model: model.clone(),
-                choices: vec![StreamChoice {
-                    index: 0,
-                    delta: json!({"content": output}),
-                    finish_reason: None,
-                }],
-            };
-            yield Ok(Event::default().data(serde_json::to_string(&content).unwrap()));
+            if !visible.is_empty() {
+                let content = StreamChunk {
+                    id: id.clone(),
+                    object: "chat.completion.chunk",
+                    created,
+                    model: model.clone(),
+                    choices: vec![StreamChoice {
+                        index: 0,
+                        delta: json!({"content": visible}),
+                        finish_reason: None,
+                    }],
+                    usage: None,
+                };
+                yield Ok(Event::default().data(serde_json::to_string(&content).unwrap()));
+            }
+
+            if !tool_calls.is_empty() {
+                let tool_delta = tool_calls.iter().enumerate().map(|(index, call)| {
+                    json!({
+                        "index": index,
+                        "id": &call.id,
+                        "type": &call.kind,
+                        "function": &call.function,
+                    })
+                }).collect::<Vec<_>>();
+                let tools = StreamChunk {
+                    id: id.clone(),
+                    object: "chat.completion.chunk",
+                    created,
+                    model: model.clone(),
+                    choices: vec![StreamChoice {
+                        index: 0,
+                        delta: json!({"tool_calls": tool_delta}),
+                        finish_reason: None,
+                    }],
+                    usage: None,
+                };
+                yield Ok(Event::default().data(serde_json::to_string(&tools).unwrap()));
+            }
 
             let done = StreamChunk {
                 id,
@@ -208,19 +250,22 @@ async fn chat_completions(
                 choices: vec![StreamChoice {
                     index: 0,
                     delta: json!({}),
-                    finish_reason: Some("stop"),
+                    finish_reason: Some(finish_reason),
                 }],
+                usage: Some(Usage {
+                    prompt_tokens,
+                    completion_tokens: estimate_tokens(&processed.storage_text),
+                    total_tokens: prompt_tokens + estimate_tokens(&processed.storage_text),
+                    prompt_tokens_details: Some(json!({"cached_tokens": 0})),
+                    completion_tokens_details: Some(json!({"reasoning_tokens": 0})),
+                }),
             };
             yield Ok(Event::default().data(serde_json::to_string(&done).unwrap()));
             yield Ok(Event::default().data("[DONE]"));
-
-            let _ = (prompt_tokens, completion_tokens);
         };
         return Ok(Sse::new(s).into_response());
     }
 
-    let prompt_tokens = estimate_tokens(&prompt);
-    let completion_tokens = estimate_tokens(&output);
     let payload = ChatCompletionResponse {
         id: completion_id,
         object: "chat.completion",
@@ -230,15 +275,17 @@ async fn chat_completions(
             index: 0,
             message: AssistantMessage {
                 role: "assistant",
-                content: output,
+                content: processed.visible_text,
+                tool_calls: if processed.tool_calls.is_empty() {
+                    None
+                } else {
+                    Some(processed.tool_calls)
+                },
+                reasoning_content: None,
             },
-            finish_reason: "stop",
+            finish_reason: processed.finish_reason,
         }],
-        usage: Usage {
-            prompt_tokens,
-            completion_tokens,
-            total_tokens: prompt_tokens + completion_tokens,
-        },
+        usage,
     };
     Ok(Json(payload).into_response())
 }
@@ -249,7 +296,7 @@ async fn create_response(
     Json(request): Json<ResponseCreateRequest>,
 ) -> Result<Response, ApiError> {
     verify_auth(&state, &headers)?;
-    let mut prompt = response_input_to_prompt(&request.input, request.instructions.as_deref());
+    let mut prompt = response_input_to_prompt(&request.input, request.instructions.as_ref());
     let extra = response_extra_instructions(&request);
     if !extra.is_empty() {
         prompt.push_str("\n\n[system]\n");
@@ -291,24 +338,41 @@ async fn create_response(
         }
     };
 
+    let processed = process_output(&output);
+    let response_output = processed.visible_text.clone().unwrap_or_default();
+
     if request.stream.unwrap_or(false) {
         let id = response_id.clone();
         let model = request.model.clone();
+        let final_payload = response_payload(
+            &id,
+            created,
+            &model,
+            &response_output,
+            estimate_tokens(&prompt),
+            estimate_tokens(&processed.storage_text),
+            &processed.tool_calls,
+            request.metadata.clone(),
+            request.tools.clone(),
+            request.tool_choice.clone(),
+        );
         let s = stream! {
             yield Ok::<_, std::convert::Infallible>(Event::default().event("response.created").data(serde_json::to_string(&json!({
                 "type": "response.created",
-                "response": {"id": id, "object": "response", "created_at": created, "model": model, "status": "in_progress"}
+                "response": {"id": id, "object": "response", "created_at": created, "model": model, "status": "in_progress", "metadata": request.metadata.clone().unwrap_or_else(|| json!({}))}
             })).unwrap()));
-            yield Ok(Event::default().event("response.output_text.delta").data(serde_json::to_string(&json!({
-                "type": "response.output_text.delta",
-                "item_id": "msg_0",
-                "output_index": 0,
-                "content_index": 0,
-                "delta": output,
-            })).unwrap()));
+            if !response_output.is_empty() {
+                yield Ok(Event::default().event("response.output_text.delta").data(serde_json::to_string(&json!({
+                    "type": "response.output_text.delta",
+                    "item_id": "msg_0",
+                    "output_index": 0,
+                    "content_index": 0,
+                    "delta": response_output,
+                })).unwrap()));
+            }
             yield Ok(Event::default().event("response.completed").data(serde_json::to_string(&json!({
                 "type": "response.completed",
-                "response": response_payload(&id, created, &model, &output, estimate_tokens(&prompt), estimate_tokens(&output)),
+                "response": final_payload,
             })).unwrap()));
             yield Ok(Event::default().data("[DONE]"));
         };
@@ -316,14 +380,18 @@ async fn create_response(
     }
 
     let prompt_tokens = estimate_tokens(&prompt);
-    let completion_tokens = estimate_tokens(&output);
+    let completion_tokens = estimate_tokens(&processed.storage_text);
     let payload = response_payload(
         &response_id,
         created,
         &request.model,
-        &output,
+        &response_output,
         prompt_tokens,
         completion_tokens,
+        &processed.tool_calls,
+        request.metadata,
+        request.tools,
+        request.tool_choice,
     );
     Ok(Json(payload).into_response())
 }
@@ -335,63 +403,46 @@ fn response_payload(
     output: &str,
     input_tokens: u64,
     output_tokens: u64,
+    tool_calls: &[openai::ToolCall],
+    metadata: Option<Value>,
+    tools: Option<Vec<Value>>,
+    tool_choice: Option<Value>,
 ) -> Value {
+    let mut output_items = vec![json!({
+        "id": "msg_0",
+        "type": "message",
+        "status": "completed",
+        "role": "assistant",
+        "content": [{"type": "output_text", "text": output, "annotations": []}],
+    })];
+    for call in tool_calls {
+        output_items.push(json!({
+            "id": call.id,
+            "type": "tool_call",
+            "status": "completed",
+            "function": &call.function,
+        }));
+    }
     json!({
         "id": id,
         "object": "response",
         "created_at": created,
+        "completed_at": Utc::now().timestamp(),
         "status": "completed",
         "model": model,
-        "output": [{
-            "id": "msg_0",
-            "type": "message",
-            "status": "completed",
-            "role": "assistant",
-            "content": [{"type": "output_text", "text": output, "annotations": []}],
-        }],
+        "output": output_items,
+        "metadata": metadata.unwrap_or_else(|| json!({})),
+        "tools": tools.unwrap_or_default(),
+        "tool_choice": tool_choice.unwrap_or_else(|| json!("auto")),
+        "text": {"format": {"type": "text"}},
         "usage": {
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
             "total_tokens": input_tokens + output_tokens,
+            "input_tokens_details": {"cached_tokens": 0},
             "output_tokens_details": {"reasoning_tokens": 0},
         },
     })
-}
-
-fn response_input_to_prompt(input: &Value, instructions: Option<&str>) -> String {
-    let mut parts = Vec::new();
-    if let Some(instructions) = instructions.filter(|s| !s.trim().is_empty()) {
-        parts.push(format!("[system]\n{}", instructions.trim()));
-    }
-    match input {
-        Value::String(text) => parts.push(format!("[user]\n{}", text.trim())),
-        Value::Array(items) => {
-            for item in items {
-                if let Some(text) = item.get("content").and_then(Value::as_str) {
-                    let role = item.get("role").and_then(Value::as_str).unwrap_or("user");
-                    parts.push(format!("[{role}]\n{}", text.trim()));
-                } else if let Some(content) = item.get("content").and_then(Value::as_array) {
-                    let role = item.get("role").and_then(Value::as_str).unwrap_or("user");
-                    let text = content
-                        .iter()
-                        .filter_map(|part| part.get("text").and_then(Value::as_str))
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    if !text.trim().is_empty() {
-                        parts.push(format!("[{role}]\n{}", text.trim()));
-                    }
-                }
-            }
-        }
-        Value::Object(_) => {
-            if let Some(text) = input.get("content").and_then(Value::as_str) {
-                let role = input.get("role").and_then(Value::as_str).unwrap_or("user");
-                parts.push(format!("[{role}]\n{}", text.trim()));
-            }
-        }
-        _ => {}
-    }
-    parts.join("\n\n")
 }
 
 fn verify_auth(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {

@@ -321,10 +321,13 @@ impl GeminiClient {
         }
         merge_set_cookie(&mut cookie_header, response.headers());
         let body = response.text().await?;
-        let access_token = capture(&TOKEN_RE, &body).context("SNlM0e access token not found")?;
         let build_label = capture(&BUILD_RE, &body);
         let session_id = capture(&SID_RE, &body);
         let language = capture(&LANG_RE, &body).unwrap_or_else(|| "en".to_string());
+        let access_token = capture(&TOKEN_RE, &body).unwrap_or_default();
+        if access_token.is_empty() && build_label.is_none() && session_id.is_none() {
+            return Err(anyhow!("Gemini init markers not found"));
+        }
 
         *self.session.lock().await = Some(SessionState {
             access_token,
