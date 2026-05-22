@@ -8,6 +8,7 @@ This branch is the Rust rewrite track for Gemini-FastAPI. The goal is to remove 
 - `GET /v1/models`
 - `POST /v1/chat/completions`
 - `POST /v1/responses`
+- `POST /v1/images/generations` with OpenAI-compatible request/response shape
 - `GET /images/{filename}` for generated-image proxy files
 - Bearer token authentication using `server.api_key`
 - YAML config loading from `CONFIG_PATH` or `config/config.yaml`
@@ -21,13 +22,47 @@ This branch is the Rust rewrite track for Gemini-FastAPI. The goal is to remove 
 - OpenAI/Responses text, streaming, and tool-compatible responses
 - OpenAI image/file input collection and Gemini content-push upload path
 - Generated/web image URL parsing, local download, and tokenized image serving
+- Optional official image generation backend:
+  - `image_generation.backend = "gemini_api"` for Gemini native image models, for example `gemini-3.1-flash-image-preview`
+  - `image_generation.backend = "imagen_api"` for Imagen models, for example `imagen-4.0-generate-001`
+  - API key is read from `image_generation.api_key` or the configured env var, default `GEMINI_API_KEY`
 - Lightweight JSONL request history at `storage.path/rust-history.jsonl`
 - Session/token refresh based on `gemini.refresh_interval`
 
 ## Notes
 
 - File/image upload requires an authenticated Gemini Web session. With unauthenticated or expired cookies, Gemini currently returns upstream error code `1100`; the Rust service surfaces this clearly as `Gemini API error code: 1100`.
+- Image generation is intentionally routed through Google's official Gemini API / Imagen API instead of the Gemini Web cookie path. The Web reverse path is kept for chat; image generation needs an API key and should be enabled explicitly.
 - Streaming is OpenAI-compatible SSE, but it still buffers the Gemini Web response before emitting deltas. True token-by-token Gemini streaming is the next deep porting item.
+
+## Image generation
+
+Enable a backend in `config/config.yaml` or your runtime config:
+
+```yaml
+image_generation:
+  backend: "gemini_api"
+  model: "gemini-3.1-flash-image-preview"
+  api_key: null
+  api_key_env: "GEMINI_API_KEY"
+  public_base_url: null
+```
+
+Call it with an OpenAI-compatible images request:
+
+```bash
+curl http://127.0.0.1:8000/v1/images/generations \
+  -H "Authorization: Bearer $API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gemini-3.1-flash-image-preview",
+    "prompt": "A tiny dragon sleeping in a teacup, watercolor",
+    "n": 1,
+    "size": "1024x1024"
+  }'
+```
+
+When `public_base_url` is empty, responses return `b64_json` so desktop clients can render without needing a public image URL. If `public_base_url` is set, generated files are stored under `storage.images_path` and returned as tokenized `/images/{filename}` URLs.
 
 ## Still being ported
 
@@ -61,5 +96,6 @@ The Rust binary was built on the default server and deployed on the Seoul VPS th
 - `/v1/responses` streaming returns response events and `[DONE]`
 - OpenAI `tools` request returns `finish_reason=tool_calls`
 - `/images/{filename}` serves stored image bytes with token validation
+- `/v1/images/generations` compiles and returns an explicit configuration error until an official Gemini API key is configured
 - upload path reaches Gemini and reports upstream `1100` clearly when cookies are unauthenticated
 - Podman memory on Seoul VPS is around 4-6 MB for the running Rust gateway

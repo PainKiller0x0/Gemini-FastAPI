@@ -9,6 +9,8 @@ pub struct Config {
     pub gemini: GeminiConfig,
     #[serde(default)]
     pub storage: StorageConfig,
+    #[serde(default)]
+    pub image_generation: ImageGenerationConfig,
 }
 
 impl Config {
@@ -119,4 +121,73 @@ fn default_storage_path() -> String {
 
 fn default_images_path() -> String {
     "data/images".to_string()
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ImageGenerationConfig {
+    #[serde(default = "default_image_backend")]
+    pub backend: String,
+    #[serde(default = "default_image_model")]
+    pub model: String,
+    #[serde(default)]
+    pub api_key: Option<String>,
+    #[serde(default = "default_image_api_key_env")]
+    pub api_key_env: String,
+    #[serde(default = "default_gemini_api_base_url")]
+    pub gemini_api_base_url: String,
+    #[serde(default = "default_imagen_api_base_url")]
+    pub imagen_api_base_url: String,
+    #[serde(default)]
+    pub public_base_url: Option<String>,
+}
+
+impl Default for ImageGenerationConfig {
+    fn default() -> Self {
+        Self {
+            backend: default_image_backend(),
+            model: default_image_model(),
+            api_key: None,
+            api_key_env: default_image_api_key_env(),
+            gemini_api_base_url: default_gemini_api_base_url(),
+            imagen_api_base_url: default_imagen_api_base_url(),
+            public_base_url: None,
+        }
+    }
+}
+
+impl ImageGenerationConfig {
+    pub fn resolved_api_key(&self) -> Option<String> {
+        self.api_key
+            .clone()
+            .filter(|key| !key.trim().is_empty())
+            .or_else(|| {
+                env::var(&self.api_key_env)
+                    .ok()
+                    .filter(|key| !key.trim().is_empty())
+            })
+    }
+
+    pub fn is_enabled(&self) -> bool {
+        !matches!(self.backend.as_str(), "" | "disabled" | "none")
+    }
+}
+
+fn default_image_backend() -> String {
+    "disabled".to_string()
+}
+
+fn default_image_model() -> String {
+    "gemini-3.1-flash-image-preview".to_string()
+}
+
+fn default_image_api_key_env() -> String {
+    "GEMINI_API_KEY".to_string()
+}
+
+fn default_gemini_api_base_url() -> String {
+    "https://generativelanguage.googleapis.com".to_string()
+}
+
+fn default_imagen_api_base_url() -> String {
+    "https://generativelanguage.googleapis.com".to_string()
 }

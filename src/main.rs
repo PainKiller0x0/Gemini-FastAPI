@@ -1,6 +1,7 @@
 mod config;
 mod gemini;
 mod history;
+mod images;
 mod openai;
 
 use std::{collections::HashMap, path::Path as FsPath, sync::Arc};
@@ -17,6 +18,7 @@ use chrono::Utc;
 use config::Config;
 use gemini::{GeminiImage, GeminiPool};
 use history::{HistoryRecord, HistoryStore, started, timestamp};
+use images::{ImageData, ImageGenerationRequest, ImageGenerationResponse};
 use openai::{
     AssistantMessage, ChatCompletionRequest, ChatCompletionResponse, Choice, ModelData,
     ModelListResponse, ResponseCreateRequest, StreamChoice, StreamChunk, Usage,
@@ -35,6 +37,7 @@ struct AppState {
     config: Config,
     gemini: Arc<GeminiPool>,
     history: HistoryStore,
+    http: reqwest::Client,
 }
 
 #[tokio::main]
@@ -64,6 +67,7 @@ async fn main() -> anyhow::Result<()> {
         config,
         gemini,
         history,
+        http: reqwest::Client::new(),
     });
 
     let app = Router::new()
@@ -71,6 +75,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/models", get(list_models))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/responses", post(create_response))
+        .route("/v1/images/generations", post(image_generations))
         .route("/images/{filename}", get(get_image))
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
@@ -97,7 +102,7 @@ async fn list_models(
 ) -> Result<Json<ModelListResponse>, ApiError> {
     verify_auth(&state, &headers)?;
     let created = Utc::now().timestamp();
-    let data = state
+    let mut data: Vec<ModelData> = state
         .gemini
         .models()
         .await
@@ -109,10 +114,38 @@ async fn list_models(
             owned_by: model.owned_by,
         })
         .collect();
+    if state.config.image_generation.is_enabled() {
+        for id in image_model_ids(&state.config.image_generation.model) {
+            if !data.iter().any(|model| model.id == id) {
+                data.push(ModelData {
+                    id,
+                    object: "model",
+                    created,
+                    owned_by: "image-generation".to_string(),
+                });
+            }
+        }
+    }
     Ok(Json(ModelListResponse {
         object: "list",
         data,
     }))
+}
+
+fn image_model_ids(configured: &str) -> Vec<String> {
+    let mut ids = vec![
+        configured.to_string(),
+        "gemini-3.1-flash-image-preview".to_string(),
+        "gemini-3-pro-image-preview".to_string(),
+        "gemini-2.5-flash-image".to_string(),
+        "imagen-4.0-generate-001".to_string(),
+        "imagen-4.0-fast-generate-001".to_string(),
+        "imagen-4.0-ultra-generate-001".to_string(),
+    ];
+    ids.retain(|id| !id.trim().is_empty());
+    ids.sort();
+    ids.dedup();
+    ids
 }
 
 async fn get_image(
@@ -175,6 +208,105 @@ async fn append_image_markdown(
         ));
     }
     Ok(out)
+}
+
+async fn save_generated_images(
+    state: &AppState,
+    images: &[images::GeneratedImage],
+) -> Result<Vec<ImageData>, ApiError> {
+    tokio::fs::create_dir_all(&state.config.storage.images_path)
+        .await
+        .map_err(|error| ApiError::from(anyhow::anyhow!(error)))?;
+    let mut out = Vec::new();
+    let public_base_url = state
+        .config
+        .image_generation
+        .public_base_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.trim_end_matches('/').to_string());
+    for image in images {
+        let data = images::decode_image_b64(image).map_err(ApiError::from)?;
+        let mut hasher = Sha256::new();
+        hasher.update(&data);
+        let sha256 = format!("{:x}", hasher.finalize());
+        let filename = format!(
+            "generated_{}.{}",
+            &sha256[..24],
+            images::image_ext(&image.mime_type)
+        );
+        let path = FsPath::new(&state.config.storage.images_path).join(&filename);
+        if tokio::fs::metadata(&path).await.is_err() {
+            tokio::fs::write(&path, data)
+                .await
+                .map_err(|error| ApiError::from(anyhow::anyhow!(error)))?;
+        }
+        let token = image_token(&filename, state.config.server.api_key.as_deref())
+            .map(|token| format!("?token={token}"))
+            .unwrap_or_default();
+        if let Some(base) = public_base_url.as_ref() {
+            out.push(ImageData {
+                b64_json: None,
+                url: Some(format!("{base}/images/{filename}{token}")),
+                revised_prompt: image.revised_prompt.clone(),
+            });
+        } else {
+            out.push(ImageData {
+                b64_json: Some(image.b64_json.clone()),
+                url: None,
+                revised_prompt: image.revised_prompt.clone(),
+            });
+        }
+    }
+    Ok(out)
+}
+
+async fn image_generations(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(request): Json<ImageGenerationRequest>,
+) -> Result<Response, ApiError> {
+    verify_auth(&state, &headers)?;
+    let start = started();
+    let model = request
+        .model
+        .clone()
+        .unwrap_or_else(|| state.config.image_generation.model.clone());
+    match images::generate_images(&state.http, &state.config.image_generation, &request).await {
+        Ok(images) => {
+            let data = save_generated_images(&state, &images).await?;
+            state.history.append(&HistoryRecord {
+                ts: timestamp(),
+                kind: "images.generations",
+                model: &model,
+                prompt_chars: request.prompt.chars().count(),
+                output_chars: data.len(),
+                latency_ms: start.elapsed().as_millis(),
+                ok: true,
+                error: None,
+            });
+            Ok(Json(ImageGenerationResponse {
+                created: Utc::now().timestamp(),
+                data,
+            })
+            .into_response())
+        }
+        Err(error) => {
+            let detail = error.to_string();
+            state.history.append(&HistoryRecord {
+                ts: timestamp(),
+                kind: "images.generations",
+                model: &model,
+                prompt_chars: request.prompt.chars().count(),
+                output_chars: 0,
+                latency_ms: start.elapsed().as_millis(),
+                ok: false,
+                error: Some(&detail),
+            });
+            Err(ApiError::from(error))
+        }
+    }
 }
 
 fn image_token(filename: &str, api_key: Option<&str>) -> Option<String> {
