@@ -26,6 +26,7 @@ class GeminiClientPool(metaclass=Singleton):
                 client_id=c.id,
                 secure_1psid=c.secure_1psid,
                 secure_1psidts=c.secure_1psidts,
+                secure_1psidcc=c.secure_1psidcc,
                 proxy=c.proxy,
             )
             self._clients.append(client)

@@ -42,6 +42,10 @@ class GeminiClientSettings(BaseModel):
     id: str = Field(..., description="Unique identifier for the client")
     secure_1psid: str = Field(..., description="Gemini Secure 1PSID")
     secure_1psidts: str = Field(..., description="Gemini Secure 1PSIDTS")
+    secure_1psidcc: str | None = Field(
+        default=None,
+        description="Optional Gemini Secure 1PSIDCC cookie for stronger session auth",
+    )
     proxy: str | None = Field(default=None, description="Proxy URL for this Gemini client")
 
     @field_validator("proxy", mode="before")

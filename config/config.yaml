@@ -21,6 +21,7 @@ gemini:
     - id: "example-id-1"   # Arbitrary client ID
       secure_1psid: "YOUR_SECURE_1PSID_HERE"
       secure_1psidts: "YOUR_SECURE_1PSIDTS_HERE"
+      secure_1psidcc: null # Optional __Secure-1PSIDCC cookie, improves authenticated session detection
       proxy: null          # Optional proxy URL (null/empty means direct connection)
   timeout: 600             # Init timeout in seconds (Not less than 30s)
   watchdog_timeout: 300    # Watchdog timeout in seconds (Not less than 30s)

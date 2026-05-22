@@ -24,9 +24,11 @@ def _resolve(value: Any, fallback: Any):
 class GeminiClientWrapper(GeminiClient):
     """Gemini client with helper methods."""
 
-    def __init__(self, client_id: str, **kwargs):
+    def __init__(self, client_id: str, secure_1psidcc: str | None = None, **kwargs):
         super().__init__(**kwargs)
         self.id = client_id
+        if secure_1psidcc:
+            self._cookies.set("__Secure-1PSIDCC", secure_1psidcc, domain=".google.com")
 
     async def init(
         self,
