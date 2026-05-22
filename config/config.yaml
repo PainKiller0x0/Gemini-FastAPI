@@ -22,6 +22,7 @@ gemini:
       secure_1psid: "YOUR_SECURE_1PSID_HERE"
       secure_1psidts: "YOUR_SECURE_1PSIDTS_HERE"
       secure_1psidcc: null # Optional __Secure-1PSIDCC cookie, improves authenticated session detection
+      cookie_header: null  # Optional full Cookie header from a working Gemini Web session; takes precedence over the three fields above
       proxy: null          # Optional proxy URL (null/empty means direct connection)
   timeout: 600             # Init timeout in seconds (Not less than 30s)
   watchdog_timeout: 300    # Watchdog timeout in seconds (Not less than 30s)

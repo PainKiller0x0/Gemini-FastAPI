@@ -13,6 +13,7 @@ This branch is the Rust rewrite track for Gemini-FastAPI. The goal is to remove 
 - Bearer token authentication using `server.api_key`
 - YAML config loading from `CONFIG_PATH` or `config/config.yaml`
 - Gemini Web cookies: `secure_1psid`, `secure_1psidts`, optional `secure_1psidcc`
+- Optional `cookie_header` for the full Cookie header copied from a known-working Gemini Web session. When set, it takes precedence over the individual cookie fields and is the preferred path for Web tools such as image generation.
 - Multiple Gemini clients with round-robin routing and failover
 - Configured custom Gemini model headers
 - Runtime Gemini model discovery via Gemini Web `otAQ7b` RPC
@@ -35,6 +36,7 @@ This branch is the Rust rewrite track for Gemini-FastAPI. The goal is to remove 
 
 - File/image upload requires an authenticated Gemini Web session. With unauthenticated or expired cookies, Gemini currently returns upstream error code `1100`; the Rust service surfaces this clearly as `Gemini API error code: 1100`.
 - Image generation can use Gemini Web cookies via `backend = "gemini_web"`. If the cookie session is unauthenticated or the account/location lacks Web image generation, Gemini Web returns a text refusal and the endpoint surfaces that clearly. Official Gemini API / Imagen API remain available as optional fallback backends.
+- If Gemini Web can generate images in your browser but this gateway cannot, copy the full browser `Cookie` header into `gemini.clients[].cookie_header`; some Web tool capability checks depend on more than the three minimal cookies.
 - Streaming is OpenAI-compatible SSE, but it still buffers the Gemini Web response before emitting deltas. True token-by-token Gemini streaming is the next deep porting item.
 
 ## Image generation

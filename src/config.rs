@@ -89,6 +89,8 @@ pub struct GeminiClientConfig {
     #[serde(default)]
     pub secure_1psidcc: Option<String>,
     #[serde(default)]
+    pub cookie_header: Option<String>,
+    #[serde(default)]
     pub proxy: Option<String>,
 }
 

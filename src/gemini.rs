@@ -781,6 +781,15 @@ impl GeminiClient {
     }
 
     fn cookie_header(&self) -> String {
+        if let Some(value) = self
+            .client_config
+            .cookie_header
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            return value.to_string();
+        }
         let mut parts = vec![
             format!("__Secure-1PSID={}", self.client_config.secure_1psid),
             format!("__Secure-1PSIDTS={}", self.client_config.secure_1psidts),
