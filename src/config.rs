@@ -100,16 +100,23 @@ pub struct GeminiModelConfig {
 pub struct StorageConfig {
     #[serde(default = "default_storage_path")]
     pub path: String,
+    #[serde(default = "default_images_path")]
+    pub images_path: String,
 }
 
 impl Default for StorageConfig {
     fn default() -> Self {
         Self {
             path: default_storage_path(),
+            images_path: default_images_path(),
         }
     }
 }
 
 fn default_storage_path() -> String {
     "data/lmdb".to_string()
+}
+
+fn default_images_path() -> String {
+    "data/images".to_string()
 }

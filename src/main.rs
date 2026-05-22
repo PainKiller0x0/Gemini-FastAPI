@@ -3,27 +3,28 @@ mod gemini;
 mod history;
 mod openai;
 
-use std::sync::Arc;
+use std::{collections::HashMap, path::Path as FsPath, sync::Arc};
 
 use async_stream::stream;
 use axum::{
     Json, Router,
-    extract::State,
-    http::{HeaderMap, StatusCode},
+    extract::{Path as AxPath, Query, State},
+    http::{HeaderMap, StatusCode, header::CONTENT_TYPE},
     response::{IntoResponse, Response, Sse, sse::Event},
     routing::{get, post},
 };
 use chrono::Utc;
 use config::Config;
-use gemini::GeminiClient;
+use gemini::{GeminiImage, GeminiPool};
 use history::{HistoryRecord, HistoryStore, started, timestamp};
 use openai::{
     AssistantMessage, ChatCompletionRequest, ChatCompletionResponse, Choice, ModelData,
     ModelListResponse, ResponseCreateRequest, StreamChoice, StreamChunk, Usage,
-    chat_extra_instructions, estimate_tokens, messages_to_prompt, process_output,
-    response_extra_instructions, response_input_to_prompt,
+    chat_extra_instructions, estimate_tokens, messages_to_gemini_input, process_output,
+    response_extra_instructions, response_input_to_gemini_input,
 };
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use tokio::net::TcpListener;
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use tracing_subscriber::EnvFilter;
@@ -32,7 +33,7 @@ use uuid::Uuid;
 #[derive(Clone)]
 struct AppState {
     config: Config,
-    gemini: Arc<GeminiClient>,
+    gemini: Arc<GeminiPool>,
     history: HistoryStore,
 }
 
@@ -43,15 +44,9 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let config = Config::load()?;
-    let first_client = config
-        .gemini
-        .clients
-        .first()
-        .cloned()
-        .ok_or_else(|| anyhow::anyhow!("at least one Gemini client is required"))?;
     let append_builtin = config.gemini.model_strategy != "overwrite";
-    let gemini = Arc::new(GeminiClient::new(
-        first_client,
+    let gemini = Arc::new(GeminiPool::new(
+        config.gemini.clients.clone(),
         config.gemini.models.clone(),
         config.gemini.timeout,
         config.gemini.refresh_interval,
@@ -76,6 +71,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/models", get(list_models))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/responses", post(create_response))
+        .route("/images/{filename}", get(get_image))
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
         .with_state(state);
@@ -91,7 +87,7 @@ async fn health(State(state): State<Arc<AppState>>) -> Json<Value> {
         "ok": true,
         "status": "ok",
         "implementation": "rust",
-        "clients": state.config.gemini.clients.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
+        "clients": state.gemini.client_ids(),
     }))
 }
 
@@ -119,6 +115,78 @@ async fn list_models(
     }))
 }
 
+async fn get_image(
+    State(state): State<Arc<AppState>>,
+    AxPath(filename): AxPath<String>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<Response, ApiError> {
+    if filename.contains('/') || filename.contains('\\') || filename.contains("..") {
+        return Err(ApiError::bad_request("invalid image filename"));
+    }
+    if let Some(expected) = image_token(&filename, state.config.server.api_key.as_deref()) {
+        let provided = params.get("token").map(String::as_str).unwrap_or("");
+        if provided != expected {
+            return Err(ApiError::unauthorized("invalid image token"));
+        }
+    }
+    let path = FsPath::new(&state.config.storage.images_path).join(&filename);
+    let data = tokio::fs::read(&path)
+        .await
+        .map_err(|_| ApiError::not_found("image not found"))?;
+    let content_type = match path
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        _ => "image/png",
+    };
+    Ok(([(CONTENT_TYPE, content_type)], data).into_response())
+}
+
+async fn append_image_markdown(
+    state: &AppState,
+    text: String,
+    images: &[GeminiImage],
+) -> Result<String, ApiError> {
+    if images.is_empty() {
+        return Ok(text);
+    }
+    let saved = state
+        .gemini
+        .save_images(images, &state.config.storage.images_path)
+        .await
+        .map_err(ApiError::from)?;
+    if saved.is_empty() {
+        return Ok(text);
+    }
+    let mut out = text;
+    for image in saved {
+        let token = image_token(&image.filename, state.config.server.api_key.as_deref())
+            .map(|token| format!("?token={token}"))
+            .unwrap_or_default();
+        out.push_str(&format!(
+            "\n\n![{}](/images/{}{})",
+            image.filename, image.filename, token
+        ));
+    }
+    Ok(out)
+}
+
+fn image_token(filename: &str, api_key: Option<&str>) -> Option<String> {
+    let api_key = api_key.filter(|s| !s.is_empty())?;
+    let mut hasher = Sha256::new();
+    hasher.update(filename.as_bytes());
+    hasher.update(b":");
+    hasher.update(api_key.as_bytes());
+    let digest = format!("{:x}", hasher.finalize());
+    Some(digest[..24].to_string())
+}
+
 async fn chat_completions(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -129,29 +197,35 @@ async fn chat_completions(
         return Err(ApiError::bad_request("messages are required"));
     }
 
-    let mut prompt = messages_to_prompt(&request.messages);
+    let mut input = messages_to_gemini_input(&request.messages);
     let extra = chat_extra_instructions(&request);
     if !extra.is_empty() {
-        prompt.push_str("\n\n[system]\n");
-        prompt.push_str(&extra);
+        input.prompt.push_str("\n\n[system]\n");
+        input.prompt.push_str(&extra);
     }
+    let prompt = input.prompt;
     let model_name = request.model.clone();
     let completion_id = format!("chatcmpl-{}", Uuid::new_v4());
     let created = Utc::now().timestamp();
     let start = started();
-    let output = match state.gemini.generate(&model_name, &prompt).await {
+    let output = match state
+        .gemini
+        .generate_output(&model_name, &prompt, &input.attachments)
+        .await
+    {
         Ok(output) => {
+            let output_text = append_image_markdown(&state, output.text, &output.images).await?;
             state.history.append(&HistoryRecord {
                 ts: timestamp(),
                 kind: "chat.completions",
                 model: &model_name,
                 prompt_chars: prompt.chars().count(),
-                output_chars: output.chars().count(),
+                output_chars: output_text.chars().count(),
                 latency_ms: start.elapsed().as_millis(),
                 ok: true,
                 error: None,
             });
-            output
+            output_text
         }
         Err(error) => {
             let detail = error.to_string();
@@ -296,31 +370,37 @@ async fn create_response(
     Json(request): Json<ResponseCreateRequest>,
 ) -> Result<Response, ApiError> {
     verify_auth(&state, &headers)?;
-    let mut prompt = response_input_to_prompt(&request.input, request.instructions.as_ref());
+    let mut input = response_input_to_gemini_input(&request.input, request.instructions.as_ref());
     let extra = response_extra_instructions(&request);
     if !extra.is_empty() {
-        prompt.push_str("\n\n[system]\n");
-        prompt.push_str(&extra);
+        input.prompt.push_str("\n\n[system]\n");
+        input.prompt.push_str(&extra);
     }
+    let prompt = input.prompt;
     if prompt.trim().is_empty() {
         return Err(ApiError::bad_request("input is required"));
     }
     let response_id = format!("resp_{}", Uuid::new_v4());
     let created = Utc::now().timestamp();
     let start = started();
-    let output = match state.gemini.generate(&request.model, &prompt).await {
+    let output = match state
+        .gemini
+        .generate_output(&request.model, &prompt, &input.attachments)
+        .await
+    {
         Ok(output) => {
+            let output_text = append_image_markdown(&state, output.text, &output.images).await?;
             state.history.append(&HistoryRecord {
                 ts: timestamp(),
                 kind: "responses",
                 model: &request.model,
                 prompt_chars: prompt.chars().count(),
-                output_chars: output.chars().count(),
+                output_chars: output_text.chars().count(),
                 latency_ms: start.elapsed().as_millis(),
                 ok: true,
                 error: None,
             });
-            output
+            output_text
         }
         Err(error) => {
             let detail = error.to_string();
@@ -482,6 +562,13 @@ impl ApiError {
     fn unauthorized(detail: impl Into<String>) -> Self {
         Self {
             status: StatusCode::UNAUTHORIZED,
+            detail: detail.into(),
+        }
+    }
+
+    fn not_found(detail: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::NOT_FOUND,
             detail: detail.into(),
         }
     }

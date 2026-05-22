@@ -1,3 +1,4 @@
+use base64::{Engine as _, engine::general_purpose};
 use once_cell::sync::Lazy;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -193,6 +194,25 @@ pub struct ProcessedOutput {
     pub finish_reason: String,
 }
 
+#[derive(Debug, Clone)]
+pub enum AttachmentSource {
+    Url(String),
+    Data(Vec<u8>),
+}
+
+#[derive(Debug, Clone)]
+pub struct InputAttachment {
+    pub filename: String,
+    pub content_type: Option<String>,
+    pub source: AttachmentSource,
+}
+
+#[derive(Debug, Clone)]
+pub struct GeminiInput {
+    pub prompt: String,
+    pub attachments: Vec<InputAttachment>,
+}
+
 pub fn messages_to_prompt(messages: &[ChatMessage]) -> String {
     let mut tool_id_to_name = std::collections::HashMap::new();
     for message in messages {
@@ -270,6 +290,17 @@ pub fn messages_to_prompt(messages: &[ChatMessage]) -> String {
     parts.join("\n")
 }
 
+pub fn messages_to_gemini_input(messages: &[ChatMessage]) -> GeminiInput {
+    let mut attachments = Vec::new();
+    for message in messages {
+        collect_attachments(message.content.as_ref(), &mut attachments);
+    }
+    GeminiInput {
+        prompt: messages_to_prompt(messages),
+        attachments,
+    }
+}
+
 fn add_tag(role: &str, content: &str, unclosed: bool) -> String {
     if unclosed {
         format!("<|im_start|>{role}\n{content}")
@@ -344,6 +375,117 @@ fn content_to_text(value: Option<&Value>) -> Option<String> {
         }
         other => Some(other.to_string()),
     }
+}
+
+fn collect_attachments(value: Option<&Value>, attachments: &mut Vec<InputAttachment>) {
+    let Some(Value::Array(items)) = value else {
+        return;
+    };
+    for (index, item) in items.iter().enumerate() {
+        match item.get("type").and_then(Value::as_str) {
+            Some("image_url") => {
+                let url = item
+                    .get("image_url")
+                    .and_then(|v| v.get("url").or(Some(v)))
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                if let Some(att) =
+                    attachment_from_url_or_data(url, format!("input_image_{}.png", index + 1))
+                {
+                    attachments.push(att);
+                }
+            }
+            Some("input_image") => {
+                let url = item.get("image_url").and_then(Value::as_str).unwrap_or("");
+                if let Some(att) =
+                    attachment_from_url_or_data(url, format!("input_image_{}.png", index + 1))
+                {
+                    attachments.push(att);
+                }
+            }
+            Some("file") | Some("input_file") => {
+                let file = item.get("file");
+                let filename = file
+                    .and_then(|f| f.get("filename"))
+                    .or_else(|| item.get("filename"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("attachment.bin")
+                    .to_string();
+                let data = file
+                    .and_then(|f| f.get("file_data"))
+                    .or_else(|| item.get("file_data"))
+                    .and_then(Value::as_str);
+                let url = file
+                    .and_then(|f| f.get("url"))
+                    .or_else(|| item.get("file_url"))
+                    .and_then(Value::as_str);
+                if let Some(data) = data {
+                    if let Some(att) = attachment_from_url_or_data(data, filename.clone()) {
+                        attachments.push(att);
+                    }
+                } else if let Some(url) = url {
+                    if let Some(att) = attachment_from_url_or_data(url, filename.clone()) {
+                        attachments.push(att);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn attachment_from_url_or_data(value: &str, fallback_filename: String) -> Option<InputAttachment> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    if value.starts_with("http://") || value.starts_with("https://") {
+        return Some(InputAttachment {
+            filename: fallback_filename,
+            content_type: None,
+            source: AttachmentSource::Url(value.to_string()),
+        });
+    }
+    if let Some((content_type, encoded)) = parse_data_url(value) {
+        let data = general_purpose::STANDARD.decode(encoded).ok()?;
+        let filename = filename_with_ext(fallback_filename, content_type);
+        return Some(InputAttachment {
+            filename,
+            content_type: Some(content_type.to_string()),
+            source: AttachmentSource::Data(data),
+        });
+    }
+    let data = general_purpose::STANDARD.decode(value).ok()?;
+    Some(InputAttachment {
+        filename: fallback_filename,
+        content_type: None,
+        source: AttachmentSource::Data(data),
+    })
+}
+
+fn parse_data_url(value: &str) -> Option<(&str, &str)> {
+    let rest = value.strip_prefix("data:")?;
+    let (meta, encoded) = rest.split_once(',')?;
+    if !meta.ends_with(";base64") {
+        return None;
+    }
+    Some((meta.trim_end_matches(";base64"), encoded))
+}
+
+fn filename_with_ext(filename: String, content_type: &str) -> String {
+    if filename.contains('.') {
+        return filename;
+    }
+    let ext = match content_type {
+        "image/png" => "png",
+        "image/jpeg" => "jpg",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        "application/pdf" => "pdf",
+        "text/plain" => "txt",
+        _ => "bin",
+    };
+    format!("{filename}.{ext}")
 }
 
 pub fn estimate_tokens(text: &str) -> u64 {
@@ -576,13 +718,18 @@ fn stable_call_id(name: &str, arguments: &str, index: usize) -> String {
     format!("call_{:x}", digest)[..29].to_string()
 }
 
+#[allow(dead_code)]
 pub fn response_input_to_prompt(input: &Value, instructions: Option<&Value>) -> String {
+    response_input_to_gemini_input(input, instructions).prompt
+}
+
+pub fn response_input_to_gemini_input(input: &Value, instructions: Option<&Value>) -> GeminiInput {
     let mut messages = Vec::new();
     for instruction in instructions_to_messages(instructions) {
         messages.push(instruction);
     }
     messages.extend(response_items_to_messages(input));
-    messages_to_prompt(&messages)
+    messages_to_gemini_input(&messages)
 }
 
 fn instructions_to_messages(instructions: Option<&Value>) -> Vec<ChatMessage> {
