@@ -70,6 +70,10 @@ pub struct GeminiImage {
     pub title: String,
     pub alt: String,
     pub generated: bool,
+    pub cid: Option<String>,
+    pub rid: Option<String>,
+    pub rcid: Option<String>,
+    pub image_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -183,6 +187,32 @@ impl GeminiPool {
                         client = client.id(),
                         ?error,
                         "Gemini client failed; trying next client if available"
+                    );
+                    last_error = Some(error);
+                }
+            }
+        }
+        Err(last_error.unwrap_or_else(|| anyhow!("all Gemini clients failed")))
+    }
+
+    pub async fn generate_web_image_output(
+        &self,
+        model_name: &str,
+        prompt: &str,
+    ) -> anyhow::Result<GeminiOutput> {
+        let len = self.clients.len();
+        let start = self.cursor.fetch_add(1, Ordering::Relaxed) % len;
+        let mut last_error = None;
+        for offset in 0..len {
+            let index = (start + offset) % len;
+            let client = &self.clients[index];
+            match client.generate_web_image_output(model_name, prompt).await {
+                Ok(output) => return Ok(output),
+                Err(error) => {
+                    tracing::warn!(
+                        client = client.id(),
+                        ?error,
+                        "Gemini image client failed; trying next client if available"
                     );
                     last_error = Some(error);
                 }
@@ -347,6 +377,26 @@ impl GeminiClient {
         prompt: &str,
         attachments: &[InputAttachment],
     ) -> anyhow::Result<GeminiOutput> {
+        self.generate_output_inner(model_name, prompt, attachments, false)
+            .await
+    }
+
+    pub async fn generate_web_image_output(
+        &self,
+        model_name: &str,
+        prompt: &str,
+    ) -> anyhow::Result<GeminiOutput> {
+        self.generate_output_inner(model_name, prompt, &[], true)
+            .await
+    }
+
+    async fn generate_output_inner(
+        &self,
+        model_name: &str,
+        prompt: &str,
+        attachments: &[InputAttachment],
+        image_mode: bool,
+    ) -> anyhow::Result<GeminiOutput> {
         if prompt.trim().is_empty() {
             return Err(anyhow!("prompt cannot be empty"));
         }
@@ -382,7 +432,7 @@ impl GeminiClient {
             &session.language
         };
 
-        let mut inner = vec![Value::Null; 69];
+        let mut inner = vec![Value::Null; if image_mode { 81 } else { 69 }];
         inner[0] = json!([prompt, 0, null, file_data, null, null, 0]);
         inner[1] = json!([language]);
         inner[2] = json!(["", "", "", null, null, null, null, null, null, ""]);
@@ -390,11 +440,23 @@ impl GeminiClient {
         inner[7] = json!(1);
         inner[10] = json!(1);
         inner[11] = json!(0);
-        inner[17] = json!([[0]]);
+        inner[17] = if image_mode {
+            json!([[22]])
+        } else {
+            json!([[0]])
+        };
         inner[18] = json!(0);
         inner[27] = json!(1);
         inner[30] = json!([4]);
         inner[41] = json!([1]);
+        if image_mode {
+            inner[3] = json!(web_tool_nonce());
+            inner[4] = json!(Uuid::new_v4().simple().to_string());
+            inner[49] = json!(14);
+            inner[67] = json!(0);
+            inner[79] = json!(1);
+            inner[80] = json!(2);
+        }
         inner[53] = json!(0);
         inner[59] = json!(uuid);
         inner[61] = json!([]);
@@ -417,6 +479,18 @@ impl GeminiClient {
             );
         }
         add_web_required_headers(&mut request_headers);
+        if image_mode {
+            request_headers.insert(
+                "x-goog-ext-73010990-jspb",
+                HeaderValue::from_static("[0,0,0]"),
+            );
+            if let Some(header) =
+                image_mode_model_header(&model, &Uuid::new_v4().to_string().to_uppercase())
+            {
+                request_headers
+                    .insert("x-goog-ext-525001261-jspb", HeaderValue::from_str(&header)?);
+            }
+        }
 
         let inner_string = serde_json::to_string(&inner)?;
         let f_req = serde_json::to_string(&json!([null, inner_string]))?;
@@ -677,31 +751,9 @@ impl GeminiClient {
         let mut saved = Vec::new();
         let mut seen = std::collections::HashSet::new();
         for image in images {
-            let mut url = image.url.clone();
-            if image.generated {
-                if url.contains("=s1024-rj") {
-                    url = url.replace("=s1024-rj", "=s2048-rj");
-                } else if !url.contains("=s2048-rj") {
-                    url.push_str("=s2048-rj");
-                }
-            }
-            let response = self
-                .http
-                .get(&url)
-                .header("Cookie", session.cookie_header.clone())
-                .send()
-                .await?;
-            if !response.status().is_success() {
-                tracing::warn!(status = %response.status(), "Gemini image download failed");
+            let Some((data, content_type)) = self.download_image(&session, image).await? else {
                 continue;
-            }
-            let content_type = response
-                .headers()
-                .get(CONTENT_TYPE)
-                .and_then(|v| v.to_str().ok())
-                .map(|s| s.split(';').next().unwrap_or(s).trim().to_string())
-                .unwrap_or_else(|| "image/png".to_string());
-            let data = response.bytes().await?.to_vec();
+            };
             let mut hasher = Sha256::new();
             hasher.update(&data);
             let sha256 = format!("{:x}", hasher.finalize());
@@ -715,6 +767,202 @@ impl GeminiClient {
             saved.push(SavedImage { filename, sha256 });
         }
         Ok(saved)
+    }
+
+    async fn download_image(
+        &self,
+        session: &SessionState,
+        image: &GeminiImage,
+    ) -> anyhow::Result<Option<(Vec<u8>, String)>> {
+        let mut urls = Vec::new();
+        if image.generated {
+            if let (Some(cid), Some(rid), Some(rcid), Some(image_id)) = (
+                image.cid.as_deref(),
+                image.rid.as_deref(),
+                image.rcid.as_deref(),
+                image.image_id.as_deref(),
+            ) {
+                if let Ok(Some(full_size)) = self
+                    .get_full_size_image(session, cid, rid, rcid, image_id)
+                    .await
+                {
+                    if let Ok(Some(url)) =
+                        self.resolve_generated_image_url(session, &full_size).await
+                    {
+                        urls.push(url);
+                    }
+                    urls.push(full_size);
+                }
+            }
+        }
+        urls.push(image_url_with_size(&image.url, image.generated, "s2048-rj"));
+        urls.push(image_url_with_size(&image.url, image.generated, "s1024-rj"));
+        urls.push(image.url.clone());
+
+        for url in dedupe_strings(urls) {
+            let response = self
+                .http
+                .get(&url)
+                .header("Cookie", session.cookie_header.clone())
+                .header(REFERER, "https://gemini.google.com/")
+                .send()
+                .await?;
+            if !response.status().is_success() {
+                tracing::warn!(status = %response.status(), "Gemini image download failed");
+                continue;
+            }
+            let content_type = response
+                .headers()
+                .get(CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.split(';').next().unwrap_or(s).trim().to_string())
+                .unwrap_or_else(|| "image/png".to_string());
+            let data = response.bytes().await?.to_vec();
+            if data.is_empty() {
+                continue;
+            }
+            return Ok(Some((data, content_type)));
+        }
+        Ok(None)
+    }
+
+    async fn resolve_generated_image_url(
+        &self,
+        session: &SessionState,
+        full_size_url: &str,
+    ) -> anyhow::Result<Option<String>> {
+        let req_url = format!(
+            "{}=d-I?alr=yes",
+            full_size_url.trim_end_matches("=d-I?alr=yes")
+        );
+        let response = self
+            .http
+            .get(&req_url)
+            .header("Cookie", session.cookie_header.clone())
+            .header(REFERER, "https://gemini.google.com/")
+            .send()
+            .await?;
+        if !response.status().is_success() {
+            return Ok(None);
+        }
+        let next_url = response.text().await?.trim().to_string();
+        if next_url.is_empty() {
+            return Ok(None);
+        }
+        let response = self
+            .http
+            .get(&next_url)
+            .header("Cookie", session.cookie_header.clone())
+            .header(REFERER, "https://gemini.google.com/")
+            .send()
+            .await?;
+        if !response.status().is_success() {
+            return Ok(Some(next_url));
+        }
+        let final_url = response.text().await?.trim().to_string();
+        if final_url.is_empty() {
+            Ok(Some(next_url))
+        } else {
+            Ok(Some(final_url))
+        }
+    }
+
+    async fn get_full_size_image(
+        &self,
+        session: &SessionState,
+        cid: &str,
+        rid: &str,
+        rcid: &str,
+        image_id: &str,
+    ) -> anyhow::Result<Option<String>> {
+        let payload = json!([
+            [null, null, null, [null, null, null, null, null, ""]],
+            [image_id, 0],
+            null,
+            [19, ""],
+            null,
+            null,
+            null,
+            null,
+            null,
+            "",
+        ]);
+        let payload = json!([payload, [rid, rcid, cid, null, ""], 1, 0, 1]);
+        let raw = self
+            .batch_execute(session, "c8o8Fe", &serde_json::to_string(&payload)?)
+            .await?;
+        for frame in parse_frames(&raw) {
+            let Some(body_str) = get_path(&frame, &[2]).and_then(Value::as_str) else {
+                continue;
+            };
+            let Ok(body) = serde_json::from_str::<Value>(body_str) else {
+                continue;
+            };
+            if let Some(url) = get_path(&body, &[0]).and_then(Value::as_str) {
+                if !url.trim().is_empty() {
+                    return Ok(Some(url.to_string()));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    async fn batch_execute(
+        &self,
+        session: &SessionState,
+        rpcid: &str,
+        payload: &str,
+    ) -> anyhow::Result<String> {
+        let reqid = self.reqid.fetch_add(100_000, Ordering::Relaxed);
+        let language = if session.language.is_empty() {
+            "en"
+        } else {
+            &session.language
+        };
+        let mut params = vec![
+            ("rpcids".to_string(), rpcid.to_string()),
+            ("hl".to_string(), language.to_string()),
+            ("_reqid".to_string(), reqid.to_string()),
+            ("rt".to_string(), "c".to_string()),
+            ("source-path".to_string(), "/app".to_string()),
+        ];
+        if let Some(build_label) = session.build_label.as_ref() {
+            params.push(("bl".to_string(), build_label.clone()));
+        }
+        if let Some(session_id) = session.session_id.as_ref() {
+            params.push(("f.sid".to_string(), session_id.clone()));
+        }
+        let rpc_payload = json!([[[rpcid, payload, null, "generic"]]]).to_string();
+        let form = vec![
+            ("at", session.access_token.as_str()),
+            ("f.req", rpc_payload.as_str()),
+        ];
+        let response = self
+            .http
+            .post(ENDPOINT_BATCH_EXEC)
+            .query(&params)
+            .header(
+                CONTENT_TYPE,
+                "application/x-www-form-urlencoded;charset=utf-8",
+            )
+            .header("X-Same-Domain", "1")
+            .header(
+                "x-goog-ext-525001261-jspb",
+                "[1,null,null,null,null,null,null,null,[4]]",
+            )
+            .header("x-goog-ext-73010989-jspb", "[0]")
+            .header("x-goog-ext-73010990-jspb", "[0]")
+            .header("Cookie", session.cookie_header.clone())
+            .form(&form)
+            .send()
+            .await?;
+        if !response.status().is_success() {
+            return Err(anyhow!(
+                "Gemini batch RPC {rpcid} failed with status {}",
+                response.status()
+            ));
+        }
+        Ok(response.text().await?)
     }
 
     async fn ensure_session(&self) -> anyhow::Result<()> {
@@ -855,6 +1103,51 @@ fn add_web_required_headers(headers: &mut HeaderMap) {
         .or_insert(HeaderValue::from_static("[0]"));
 }
 
+fn image_mode_model_header(model: &GeminiModel, request_uuid: &str) -> Option<String> {
+    let raw = model.model_header.get("x-goog-ext-525001261-jspb")?;
+    let parsed = serde_json::from_str::<Value>(raw).ok()?;
+    let model_id = get_path(&parsed, &[4]).and_then(Value::as_str)?;
+    Some(format!(
+        r#"[1,null,null,null,"{model_id}",null,null,0,[4,5,6,8],null,null,2,null,null,1,2,"{request_uuid}"]"#
+    ))
+}
+
+fn web_tool_nonce() -> String {
+    let mut nonce = String::from("!");
+    while nonce.len() < 2600 {
+        nonce.push_str(&Uuid::new_v4().simple().to_string());
+    }
+    nonce.truncate(2600);
+    nonce
+}
+
+fn image_url_with_size(url: &str, generated: bool, size: &str) -> String {
+    if !generated {
+        return url.to_string();
+    }
+    if url.contains("=s1024-rj") {
+        url.replace("=s1024-rj", &format!("={size}"))
+    } else if url.contains("=s2048-rj") {
+        url.replace("=s2048-rj", &format!("={size}"))
+    } else {
+        format!("{url}={size}")
+    }
+}
+
+fn dedupe_strings(values: Vec<String>) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for value in values {
+        if value.trim().is_empty() {
+            continue;
+        }
+        if seen.insert(value.clone()) {
+            out.push(value);
+        }
+    }
+    out
+}
+
 fn extract_output_from_response(raw: &str) -> anyhow::Result<GeminiOutput> {
     if let Some(code) = capture(&BARD_ERROR_RE, raw) {
         return Err(anyhow!("Gemini API error code: {code}"));
@@ -873,10 +1166,19 @@ fn extract_output_from_response(raw: &str) -> anyhow::Result<GeminiOutput> {
         let Ok(parsed_inner) = serde_json::from_str::<Value>(inner) else {
             continue;
         };
+        let cid = get_path(&parsed_inner, &[1, 0])
+            .and_then(Value::as_str)
+            .map(ToString::to_string);
+        let rid = get_path(&parsed_inner, &[1, 1])
+            .and_then(Value::as_str)
+            .map(ToString::to_string);
         let Some(candidates) = get_path(&parsed_inner, &[4]).and_then(Value::as_array) else {
             continue;
         };
         for candidate in candidates {
+            let rcid = get_path(candidate, &[0])
+                .and_then(Value::as_str)
+                .map(ToString::to_string);
             if let Some(text) = get_path(candidate, &[1, 0])
                 .or_else(|| get_path(candidate, &[22, 0]))
                 .and_then(Value::as_str)
@@ -900,11 +1202,23 @@ fn extract_output_from_response(raw: &str) -> anyhow::Result<GeminiOutput> {
                             .unwrap_or("")
                             .to_string(),
                         generated: false,
+                        cid: None,
+                        rid: None,
+                        rcid: None,
+                        image_id: None,
                     });
                 }
             }
             for (idx, gen_image) in generated_image_values(candidate).into_iter().enumerate() {
                 if let Some(url) = get_path(gen_image, &[0, 3, 3]).and_then(Value::as_str) {
+                    let image_id = get_path(gen_image, &[1, 0])
+                        .and_then(Value::as_str)
+                        .map(ToString::to_string)
+                        .or_else(|| {
+                            Some(format!(
+                                "http://googleusercontent.com/image_generation_content/{idx}"
+                            ))
+                        });
                     output.images.push(GeminiImage {
                         url: url.to_string(),
                         title: format!("[Generated Image {}]", idx + 1),
@@ -913,6 +1227,10 @@ fn extract_output_from_response(raw: &str) -> anyhow::Result<GeminiOutput> {
                             .unwrap_or("")
                             .to_string(),
                         generated: true,
+                        cid: cid.clone(),
+                        rid: rid.clone(),
+                        rcid: rcid.clone(),
+                        image_id,
                     });
                 }
             }

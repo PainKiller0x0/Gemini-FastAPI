@@ -302,13 +302,14 @@ async fn generate_web_images(
     request: &ImageGenerationRequest,
 ) -> Result<Vec<ImageData>, ApiError> {
     let n = request.n.unwrap_or(1).clamp(1, 4);
-    let prompt = format!(
-        "Generate {n} image(s) for this request. Return the actual generated image(s), not a text-only explanation. Request: {}",
-        request.prompt.trim()
-    );
+    let prompt = if n > 1 {
+        format!("请生成 {n} 张图片：{}", request.prompt.trim())
+    } else {
+        request.prompt.trim().to_string()
+    };
     let output = state
         .gemini
-        .generate_output(&state.config.image_generation.web_model, &prompt, &[])
+        .generate_web_image_output(&state.config.image_generation.web_model, &prompt)
         .await
         .map_err(ApiError::from)?;
     if output.images.is_empty() {
