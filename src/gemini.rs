@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
     sync::atomic::{AtomicU64, Ordering},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, anyhow};
@@ -21,6 +21,7 @@ use crate::config::{GeminiClientConfig, GeminiModelConfig};
 const ENDPOINT_GOOGLE: &str = "https://www.google.com";
 const ENDPOINT_INIT: &str = "https://gemini.google.com/app";
 const ENDPOINT_GENERATE: &str = "https://gemini.google.com/_/BardChatUi/data/assistant.lamda.BardFrontendService/StreamGenerate";
+const ENDPOINT_BATCH_EXEC: &str = "https://gemini.google.com/_/BardChatUi/data/batchexecute";
 
 static TOKEN_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r#"\"SNlM0e\":\s*\"(.*?)\""#).unwrap());
 static BUILD_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r#"\"cfb2h\":\s*\"(.*?)\""#).unwrap());
@@ -34,21 +35,23 @@ pub struct GeminiModel {
     pub owned_by: String,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct SessionState {
     access_token: String,
     build_label: Option<String>,
     session_id: Option<String>,
     language: String,
     cookie_header: String,
+    created_at: Instant,
 }
 
 pub struct GeminiClient {
     http: Client,
     client_config: GeminiClientConfig,
-    models: Vec<GeminiModel>,
+    models: Mutex<Vec<GeminiModel>>,
     reqid: AtomicU64,
     session: Mutex<Option<SessionState>>,
+    refresh_interval: Duration,
 }
 
 impl GeminiClient {
@@ -56,6 +59,7 @@ impl GeminiClient {
         client_config: GeminiClientConfig,
         configured_models: Vec<GeminiModelConfig>,
         timeout_seconds: u64,
+        refresh_interval_seconds: u64,
         append_builtin: bool,
     ) -> anyhow::Result<Self> {
         let mut headers = HeaderMap::new();
@@ -96,14 +100,86 @@ impl GeminiClient {
         Ok(Self {
             http,
             client_config,
-            models,
+            models: Mutex::new(models),
             reqid: AtomicU64::new(10_000),
             session: Mutex::new(None),
+            refresh_interval: Duration::from_secs(refresh_interval_seconds),
         })
     }
 
-    pub fn models(&self) -> Vec<GeminiModel> {
-        self.models.clone()
+    pub async fn models(&self) -> Vec<GeminiModel> {
+        self.models.lock().await.clone()
+    }
+
+    pub async fn refresh_runtime_models(&self) -> anyhow::Result<usize> {
+        self.ensure_session().await?;
+        let session = self
+            .session
+            .lock()
+            .await
+            .clone()
+            .context("Gemini session is not initialized")?;
+        let reqid = self.reqid.fetch_add(100_000, Ordering::Relaxed);
+        let language = if session.language.is_empty() {
+            "en"
+        } else {
+            &session.language
+        };
+        let mut params = vec![
+            ("rpcids".to_string(), "otAQ7b".to_string()),
+            ("hl".to_string(), language.to_string()),
+            ("_reqid".to_string(), reqid.to_string()),
+            ("rt".to_string(), "c".to_string()),
+            ("source-path".to_string(), "/app".to_string()),
+        ];
+        if let Some(build_label) = session.build_label.as_ref() {
+            params.push(("bl".to_string(), build_label.clone()));
+        }
+        if let Some(session_id) = session.session_id.as_ref() {
+            params.push(("f.sid".to_string(), session_id.clone()));
+        }
+        let payload = json!([[["otAQ7b", "[]", null, "generic"]]]).to_string();
+        let form = vec![
+            ("at", session.access_token.as_str()),
+            ("f.req", payload.as_str()),
+        ];
+        let response = self
+            .http
+            .post(ENDPOINT_BATCH_EXEC)
+            .query(&params)
+            .header(
+                CONTENT_TYPE,
+                "application/x-www-form-urlencoded;charset=utf-8",
+            )
+            .header("X-Same-Domain", "1")
+            .header(
+                "x-goog-ext-525001261-jspb",
+                "[1,null,null,null,null,null,null,null,[4]]",
+            )
+            .header("x-goog-ext-73010989-jspb", "[0]")
+            .header("Cookie", session.cookie_header)
+            .form(&form)
+            .send()
+            .await?;
+        if !response.status().is_success() {
+            return Err(anyhow!(
+                "Gemini model discovery failed with status {}",
+                response.status()
+            ));
+        }
+        let raw = response.text().await?;
+        let discovered = extract_runtime_models(&raw)?;
+        let mut models = self.models.lock().await;
+        let before = models.len();
+        for model in discovered {
+            if !models
+                .iter()
+                .any(|existing| existing.model_name == model.model_name)
+            {
+                models.push(model);
+            }
+        }
+        Ok(models.len().saturating_sub(before))
     }
 
     pub async fn generate(&self, model_name: &str, prompt: &str) -> anyhow::Result<String> {
@@ -112,6 +188,8 @@ impl GeminiClient {
         }
         let model = self
             .models
+            .lock()
+            .await
             .iter()
             .find(|m| m.model_name == model_name)
             .cloned()
@@ -209,8 +287,13 @@ impl GeminiClient {
     }
 
     async fn ensure_session(&self) -> anyhow::Result<()> {
-        if self.session.lock().await.is_some() {
-            return Ok(());
+        {
+            let guard = self.session.lock().await;
+            if let Some(session) = guard.as_ref() {
+                if session.created_at.elapsed() < self.refresh_interval {
+                    return Ok(());
+                }
+            }
         }
 
         let mut cookie_header = self.cookie_header();
@@ -249,6 +332,7 @@ impl GeminiClient {
             session_id,
             language,
             cookie_header,
+            created_at: Instant::now(),
         });
         Ok(())
     }
@@ -410,5 +494,125 @@ fn merge_set_cookie(cookie_header: &mut String, headers: &HeaderMap) {
             cookie_header.push_str("; ");
             cookie_header.push_str(pair);
         }
+    }
+}
+
+fn extract_runtime_models(raw: &str) -> anyhow::Result<Vec<GeminiModel>> {
+    let frames = parse_frames(raw);
+    let mut out = Vec::new();
+    for frame in frames {
+        let Some(body_str) = get_path(&frame, &[2]).and_then(Value::as_str) else {
+            continue;
+        };
+        let Ok(body) = serde_json::from_str::<Value>(body_str) else {
+            continue;
+        };
+        let status = get_path(&body, &[14])
+            .and_then(Value::as_i64)
+            .unwrap_or(1000);
+        let tier_flags = get_path(&body, &[16])
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let capability_flags = get_path(&body, &[17])
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let (capacity, capacity_field) = compute_capacity(&tier_flags, &capability_flags);
+        let Some(models) = get_path(&body, &[15]).and_then(Value::as_array) else {
+            continue;
+        };
+        for model_data in models {
+            let Some(model_id) = get_path(model_data, &[0])
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+            else {
+                continue;
+            };
+            let display_name = get_path(model_data, &[1])
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let model_name = runtime_model_name(model_id, display_name);
+            if model_name.is_empty() {
+                continue;
+            }
+            let mut header = HashMap::new();
+            header.insert(
+                "x-goog-ext-525001261-jspb".to_string(),
+                model_header(model_id, capacity, capacity_field),
+            );
+            let owned_by = if status == 1000 {
+                "gemini-web-runtime"
+            } else {
+                "gemini-web-runtime-limited"
+            };
+            out.push(GeminiModel {
+                model_name,
+                model_header: header,
+                owned_by: owned_by.to_string(),
+            });
+        }
+    }
+    Ok(out)
+}
+
+fn runtime_model_name(model_id: &str, display_name: &str) -> String {
+    match model_id {
+        "e6fa609c3fa255c0" => "gemini-3.1-pro".to_string(),
+        "56fdd199312815e2" => "gemini-3.5-flash".to_string(),
+        "8c46e95b1a07cecc" => "gemini-3.1-flash-lite".to_string(),
+        "fbb127bbb056c959" => "gemini-3-flash".to_string(),
+        "9d8ca3786ebdfbea" => "gemini-3-pro".to_string(),
+        _ => {
+            let slug = display_name
+                .to_lowercase()
+                .chars()
+                .map(|c| {
+                    if c.is_ascii_alphanumeric() || c == '.' {
+                        c
+                    } else {
+                        '-'
+                    }
+                })
+                .collect::<String>()
+                .trim_matches('-')
+                .to_string();
+            if slug.is_empty() {
+                String::new()
+            } else if slug.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+                format!("gemini-{slug}")
+            } else {
+                format!("gemini-web-{slug}")
+            }
+        }
+    }
+}
+
+fn compute_capacity(tier_flags: &[Value], capability_flags: &[Value]) -> (i64, i64) {
+    let has_tier = |needle| tier_flags.iter().any(|v| v.as_i64() == Some(needle));
+    let has_cap = |needle| capability_flags.iter().any(|v| v.as_i64() == Some(needle));
+    if has_tier(21) {
+        return (1, 13);
+    }
+    if has_tier(22) {
+        return (2, 13);
+    }
+    if has_cap(115) {
+        return (4, 12);
+    }
+    if has_tier(16) || has_cap(106) {
+        return (3, 12);
+    }
+    if has_tier(8) || (!has_cap(106) && has_cap(19)) {
+        return (2, 12);
+    }
+    (1, 12)
+}
+
+fn model_header(model_id: &str, capacity: i64, capacity_field: i64) -> String {
+    if capacity_field == 13 {
+        format!(r#"[1,null,null,null,"{model_id}",null,null,0,[4],null,null,null,{capacity}]"#)
+    } else {
+        format!(r#"[1,null,null,null,"{model_id}",null,null,0,[4],null,null,{capacity}]"#)
     }
 }

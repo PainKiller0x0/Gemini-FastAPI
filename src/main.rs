@@ -1,5 +1,6 @@
 mod config;
 mod gemini;
+mod history;
 mod openai;
 
 use std::sync::Arc;
@@ -15,9 +16,11 @@ use axum::{
 use chrono::Utc;
 use config::Config;
 use gemini::GeminiClient;
+use history::{HistoryRecord, HistoryStore, started, timestamp};
 use openai::{
     AssistantMessage, ChatCompletionRequest, ChatCompletionResponse, Choice, ModelData,
-    ModelListResponse, StreamChoice, StreamChunk, Usage, estimate_tokens, messages_to_prompt,
+    ModelListResponse, ResponseCreateRequest, StreamChoice, StreamChunk, Usage,
+    chat_extra_instructions, estimate_tokens, messages_to_prompt, response_extra_instructions,
 };
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
@@ -29,6 +32,7 @@ use uuid::Uuid;
 struct AppState {
     config: Config,
     gemini: Arc<GeminiClient>,
+    history: HistoryStore,
 }
 
 #[tokio::main]
@@ -49,15 +53,28 @@ async fn main() -> anyhow::Result<()> {
         first_client,
         config.gemini.models.clone(),
         config.gemini.timeout,
+        config.gemini.refresh_interval,
         append_builtin,
     )?);
     let addr = config.server.addr()?;
-    let state = Arc::new(AppState { config, gemini });
+    if let Err(error) = gemini.refresh_runtime_models().await {
+        tracing::warn!(
+            ?error,
+            "Gemini runtime model discovery failed; continuing with configured models"
+        );
+    }
+    let history = HistoryStore::new(config.storage.path.clone());
+    let state = Arc::new(AppState {
+        config,
+        gemini,
+        history,
+    });
 
     let app = Router::new()
         .route("/health", get(health))
         .route("/v1/models", get(list_models))
         .route("/v1/chat/completions", post(chat_completions))
+        .route("/v1/responses", post(create_response))
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
         .with_state(state);
@@ -86,6 +103,7 @@ async fn list_models(
     let data = state
         .gemini
         .models()
+        .await
         .into_iter()
         .map(|model| ModelData {
             id: model.model_name,
@@ -110,11 +128,45 @@ async fn chat_completions(
         return Err(ApiError::bad_request("messages are required"));
     }
 
-    let prompt = messages_to_prompt(&request.messages);
+    let mut prompt = messages_to_prompt(&request.messages);
+    let extra = chat_extra_instructions(&request);
+    if !extra.is_empty() {
+        prompt.push_str("\n\n[system]\n");
+        prompt.push_str(&extra);
+    }
     let model_name = request.model.clone();
     let completion_id = format!("chatcmpl-{}", Uuid::new_v4());
     let created = Utc::now().timestamp();
-    let output = state.gemini.generate(&model_name, &prompt).await?;
+    let start = started();
+    let output = match state.gemini.generate(&model_name, &prompt).await {
+        Ok(output) => {
+            state.history.append(&HistoryRecord {
+                ts: timestamp(),
+                kind: "chat.completions",
+                model: &model_name,
+                prompt_chars: prompt.chars().count(),
+                output_chars: output.chars().count(),
+                latency_ms: start.elapsed().as_millis(),
+                ok: true,
+                error: None,
+            });
+            output
+        }
+        Err(error) => {
+            let detail = error.to_string();
+            state.history.append(&HistoryRecord {
+                ts: timestamp(),
+                kind: "chat.completions",
+                model: &model_name,
+                prompt_chars: prompt.chars().count(),
+                output_chars: 0,
+                latency_ms: start.elapsed().as_millis(),
+                ok: false,
+                error: Some(&detail),
+            });
+            return Err(ApiError::from(error));
+        }
+    };
 
     if request.stream.unwrap_or(false) {
         let prompt_tokens = estimate_tokens(&prompt);
@@ -189,6 +241,157 @@ async fn chat_completions(
         },
     };
     Ok(Json(payload).into_response())
+}
+
+async fn create_response(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(request): Json<ResponseCreateRequest>,
+) -> Result<Response, ApiError> {
+    verify_auth(&state, &headers)?;
+    let mut prompt = response_input_to_prompt(&request.input, request.instructions.as_deref());
+    let extra = response_extra_instructions(&request);
+    if !extra.is_empty() {
+        prompt.push_str("\n\n[system]\n");
+        prompt.push_str(&extra);
+    }
+    if prompt.trim().is_empty() {
+        return Err(ApiError::bad_request("input is required"));
+    }
+    let response_id = format!("resp_{}", Uuid::new_v4());
+    let created = Utc::now().timestamp();
+    let start = started();
+    let output = match state.gemini.generate(&request.model, &prompt).await {
+        Ok(output) => {
+            state.history.append(&HistoryRecord {
+                ts: timestamp(),
+                kind: "responses",
+                model: &request.model,
+                prompt_chars: prompt.chars().count(),
+                output_chars: output.chars().count(),
+                latency_ms: start.elapsed().as_millis(),
+                ok: true,
+                error: None,
+            });
+            output
+        }
+        Err(error) => {
+            let detail = error.to_string();
+            state.history.append(&HistoryRecord {
+                ts: timestamp(),
+                kind: "responses",
+                model: &request.model,
+                prompt_chars: prompt.chars().count(),
+                output_chars: 0,
+                latency_ms: start.elapsed().as_millis(),
+                ok: false,
+                error: Some(&detail),
+            });
+            return Err(ApiError::from(error));
+        }
+    };
+
+    if request.stream.unwrap_or(false) {
+        let id = response_id.clone();
+        let model = request.model.clone();
+        let s = stream! {
+            yield Ok::<_, std::convert::Infallible>(Event::default().event("response.created").data(serde_json::to_string(&json!({
+                "type": "response.created",
+                "response": {"id": id, "object": "response", "created_at": created, "model": model, "status": "in_progress"}
+            })).unwrap()));
+            yield Ok(Event::default().event("response.output_text.delta").data(serde_json::to_string(&json!({
+                "type": "response.output_text.delta",
+                "item_id": "msg_0",
+                "output_index": 0,
+                "content_index": 0,
+                "delta": output,
+            })).unwrap()));
+            yield Ok(Event::default().event("response.completed").data(serde_json::to_string(&json!({
+                "type": "response.completed",
+                "response": response_payload(&id, created, &model, &output, estimate_tokens(&prompt), estimate_tokens(&output)),
+            })).unwrap()));
+            yield Ok(Event::default().data("[DONE]"));
+        };
+        return Ok(Sse::new(s).into_response());
+    }
+
+    let prompt_tokens = estimate_tokens(&prompt);
+    let completion_tokens = estimate_tokens(&output);
+    let payload = response_payload(
+        &response_id,
+        created,
+        &request.model,
+        &output,
+        prompt_tokens,
+        completion_tokens,
+    );
+    Ok(Json(payload).into_response())
+}
+
+fn response_payload(
+    id: &str,
+    created: i64,
+    model: &str,
+    output: &str,
+    input_tokens: u64,
+    output_tokens: u64,
+) -> Value {
+    json!({
+        "id": id,
+        "object": "response",
+        "created_at": created,
+        "status": "completed",
+        "model": model,
+        "output": [{
+            "id": "msg_0",
+            "type": "message",
+            "status": "completed",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": output, "annotations": []}],
+        }],
+        "usage": {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "total_tokens": input_tokens + output_tokens,
+            "output_tokens_details": {"reasoning_tokens": 0},
+        },
+    })
+}
+
+fn response_input_to_prompt(input: &Value, instructions: Option<&str>) -> String {
+    let mut parts = Vec::new();
+    if let Some(instructions) = instructions.filter(|s| !s.trim().is_empty()) {
+        parts.push(format!("[system]\n{}", instructions.trim()));
+    }
+    match input {
+        Value::String(text) => parts.push(format!("[user]\n{}", text.trim())),
+        Value::Array(items) => {
+            for item in items {
+                if let Some(text) = item.get("content").and_then(Value::as_str) {
+                    let role = item.get("role").and_then(Value::as_str).unwrap_or("user");
+                    parts.push(format!("[{role}]\n{}", text.trim()));
+                } else if let Some(content) = item.get("content").and_then(Value::as_array) {
+                    let role = item.get("role").and_then(Value::as_str).unwrap_or("user");
+                    let text = content
+                        .iter()
+                        .filter_map(|part| part.get("text").and_then(Value::as_str))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    if !text.trim().is_empty() {
+                        parts.push(format!("[{role}]\n{}", text.trim()));
+                    }
+                }
+            }
+        }
+        Value::Object(_) => {
+            if let Some(text) = input.get("content").and_then(Value::as_str) {
+                let role = input.get("role").and_then(Value::as_str).unwrap_or("user");
+                parts.push(format!("[{role}]\n{}", text.trim()));
+            }
+        }
+        _ => {}
+    }
+    parts.join("\n\n")
 }
 
 fn verify_auth(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {

@@ -7,6 +7,12 @@ pub struct ChatCompletionRequest {
     pub messages: Vec<ChatMessage>,
     #[serde(default)]
     pub stream: Option<bool>,
+    #[serde(default)]
+    pub tools: Option<Vec<Value>>,
+    #[serde(default)]
+    pub tool_choice: Option<Value>,
+    #[serde(default)]
+    pub response_format: Option<Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -108,4 +114,66 @@ fn content_to_text(value: Option<&Value>) -> Option<String> {
 
 pub fn estimate_tokens(text: &str) -> u64 {
     ((text.chars().count() as f64) / 4.0).ceil() as u64
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ResponseCreateRequest {
+    pub model: String,
+    pub input: Value,
+    #[serde(default)]
+    pub instructions: Option<String>,
+    #[serde(default)]
+    pub stream: Option<bool>,
+    #[serde(default)]
+    pub tools: Option<Vec<Value>>,
+    #[serde(default)]
+    pub tool_choice: Option<Value>,
+    #[serde(default)]
+    pub response_format: Option<Value>,
+}
+
+pub fn chat_extra_instructions(request: &ChatCompletionRequest) -> String {
+    let mut parts = Vec::new();
+    if let Some(format) = &request.response_format {
+        if format.get("type").and_then(Value::as_str) == Some("json_object") {
+            parts.push("Return valid JSON only. Do not wrap it in Markdown.".to_string());
+        }
+    }
+    if let Some(tools) = &request.tools {
+        if !tools.is_empty() {
+            parts.push(format!(
+                "Tools are available. If a tool is needed, respond with a JSON object: {{\"tool_calls\":[{{\"name\":\"tool_name\",\"arguments\":{{}}}}]}}. Available tools: {}",
+                serde_json::to_string(tools).unwrap_or_else(|_| "[]".to_string())
+            ));
+        }
+    }
+    if let Some(choice) = &request.tool_choice {
+        if !choice.is_null() {
+            parts.push(format!("Tool choice constraint: {}", choice));
+        }
+    }
+    parts.join("\n")
+}
+
+pub fn response_extra_instructions(request: &ResponseCreateRequest) -> String {
+    let mut parts = Vec::new();
+    if let Some(format) = &request.response_format {
+        if format.get("type").and_then(Value::as_str) == Some("json_object") {
+            parts.push("Return valid JSON only. Do not wrap it in Markdown.".to_string());
+        }
+    }
+    if let Some(tools) = &request.tools {
+        if !tools.is_empty() {
+            parts.push(format!(
+                "Tools are available. If a tool is needed, respond with a JSON object: {{\"tool_calls\":[{{\"name\":\"tool_name\",\"arguments\":{{}}}}]}}. Available tools: {}",
+                serde_json::to_string(tools).unwrap_or_else(|_| "[]".to_string())
+            ));
+        }
+    }
+    if let Some(choice) = &request.tool_choice {
+        if !choice.is_null() {
+            parts.push(format!("Tool choice constraint: {}", choice));
+        }
+    }
+    parts.join("\n")
 }
