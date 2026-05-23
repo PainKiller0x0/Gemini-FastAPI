@@ -1458,12 +1458,34 @@ async fn read_response_text_with_progress(
     let mut raw_bytes = Vec::new();
     let mut emitted = String::new();
     let mut upstream = response.bytes_stream();
+    let mut first_upstream_chunk_ms: Option<u128> = None;
+    let mut first_text_delta_ms: Option<u128> = None;
     while let Some(chunk) = upstream.next().await {
         let chunk = chunk?;
+        if first_upstream_chunk_ms.is_none() {
+            let elapsed = request_started.elapsed().as_millis();
+            first_upstream_chunk_ms = Some(elapsed);
+            tracing::info!(
+                client = client_id,
+                model = model_name,
+                first_upstream_chunk_ms = elapsed,
+                "Gemini generate first upstream chunk"
+            );
+        }
         raw_bytes.extend_from_slice(&chunk);
         let raw = String::from_utf8_lossy(&raw_bytes);
         if let Some(text) = extract_partial_text_from_response(&raw) {
-            send_stream_delta(&progress, &mut emitted, &text);
+            if send_stream_delta(&progress, &mut emitted, &text) && first_text_delta_ms.is_none() {
+                let elapsed = request_started.elapsed().as_millis();
+                first_text_delta_ms = Some(elapsed);
+                tracing::info!(
+                    client = client_id,
+                    model = model_name,
+                    first_text_delta_ms = elapsed,
+                    streamed_chars = emitted.chars().count(),
+                    "Gemini generate first text delta"
+                );
+            }
         }
     }
     let raw = String::from_utf8_lossy(&raw_bytes).to_string();
@@ -1472,6 +1494,8 @@ async fn read_response_text_with_progress(
         model = model_name,
         body_ms = body_started.elapsed().as_millis(),
         total_ms = request_started.elapsed().as_millis(),
+        first_upstream_chunk_ms = first_upstream_chunk_ms,
+        first_text_delta_ms = first_text_delta_ms,
         response_bytes = raw.len(),
         streamed_chars = emitted.chars().count(),
         "Gemini generate response body streamed"
@@ -1479,20 +1503,27 @@ async fn read_response_text_with_progress(
     Ok(raw)
 }
 
-fn send_stream_delta(progress: &mpsc::UnboundedSender<String>, emitted: &mut String, text: &str) {
+fn send_stream_delta(
+    progress: &mpsc::UnboundedSender<String>,
+    emitted: &mut String,
+    text: &str,
+) -> bool {
     if text.trim().is_empty() || starts_like_tool_block(text) {
-        return;
+        return false;
     }
     if text.starts_with(emitted.as_str()) {
         let delta = &text[emitted.len()..];
         if !delta.is_empty() {
             let _ = progress.send(delta.to_string());
             *emitted = text.to_string();
+            return true;
         }
     } else if emitted.is_empty() {
         let _ = progress.send(text.to_string());
         *emitted = text.to_string();
+        return true;
     }
+    false
 }
 
 fn starts_like_tool_block(text: &str) -> bool {
