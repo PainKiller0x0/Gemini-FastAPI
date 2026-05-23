@@ -48,6 +48,25 @@ static COOKIE_HEADER_RE: Lazy<Regex> =
 static WEB_TOOL_NONCE_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r#"![-_A-Za-z0-9]{1000,}"#).unwrap());
 
+fn contains_cjk(text: &str) -> bool {
+    text.chars().any(|ch| {
+        let code = ch as u32;
+        (0x3400..=0x4DBF).contains(&code)
+            || (0x4E00..=0x9FFF).contains(&code)
+            || (0xF900..=0xFAFF).contains(&code)
+    })
+}
+
+fn request_language<'a>(session_language: &'a str, prompt: &str, image_mode: bool) -> &'a str {
+    if image_mode || contains_cjk(prompt) {
+        "zh-CN"
+    } else if session_language.is_empty() {
+        "en"
+    } else {
+        session_language
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct GeminiModel {
     pub model_name: String,
@@ -488,13 +507,7 @@ impl GeminiClient {
 
         let reqid = self.reqid.fetch_add(100_000, Ordering::Relaxed);
         let uuid = Uuid::new_v4().to_string().to_uppercase();
-        let language: &str = if image_mode {
-            "zh-CN"
-        } else if session.language.is_empty() {
-            "en"
-        } else {
-            &session.language
-        };
+        let language = request_language(&session.language, prompt, image_mode);
 
         let mut inner = vec![Value::Null; if image_mode { 81 } else { 69 }];
         inner[0] = json!([prompt, 0, null, file_data, null, null, 0]);
@@ -1902,5 +1915,34 @@ fn ext_from_content_type(content_type: &str) -> Option<&'static str> {
         "image/gif" => Some("gif"),
         "image/webp" => Some("webp"),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{contains_cjk, request_language};
+
+    #[test]
+    fn detects_cjk_prompt_text() {
+        assert!(contains_cjk(
+            "\u{7528}\u{4e00}\u{53e5}\u{4e2d}\u{6587}\u{56de}\u{590d}"
+        ));
+        assert!(contains_cjk("\u{4e2d}\u{6587} mixed English"));
+        assert!(!contains_cjk("plain ascii prompt"));
+    }
+
+    #[test]
+    fn cjk_prompts_force_chinese_locale() {
+        assert_eq!(
+            request_language("en", "\u{4eca}\u{5929}\u{5468}\u{51e0}\u{ff1f}", false),
+            "zh-CN"
+        );
+        assert_eq!(
+            request_language("", "\u{4eca}\u{5929}\u{5468}\u{51e0}\u{ff1f}", false),
+            "zh-CN"
+        );
+        assert_eq!(request_language("en", "draw image", true), "zh-CN");
+        assert_eq!(request_language("", "plain ascii", false), "en");
+        assert_eq!(request_language("fr", "plain ascii", false), "fr");
     }
 }
