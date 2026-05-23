@@ -518,6 +518,141 @@ async fn chat_completions(
     let created = Utc::now().timestamp();
     let start = started();
     let image_tool = should_use_image_tool(&state, &model_name, &prompt);
+    if image_tool && request.stream.unwrap_or(false) {
+        let state_for_stream = state.clone();
+        let headers_for_stream = headers.clone();
+        let prompt_for_stream = prompt.clone();
+        let model_for_stream = model_name.clone();
+        let web_model = state.config.image_generation.web_model.clone();
+        let id = completion_id.clone();
+        let s = stream! {
+            let role = StreamChunk {
+                id: id.clone(),
+                object: "chat.completion.chunk",
+                created,
+                model: model_for_stream.clone(),
+                choices: vec![StreamChoice {
+                    index: 0,
+                    delta: json!({"role": "assistant"}),
+                    finish_reason: None,
+                }],
+                usage: None,
+            };
+            yield Ok::<_, std::convert::Infallible>(Event::default().data(serde_json::to_string(&role).unwrap()));
+
+            let status = StreamChunk {
+                id: id.clone(),
+                object: "chat.completion.chunk",
+                created,
+                model: model_for_stream.clone(),
+                choices: vec![StreamChoice {
+                    index: 0,
+                    delta: json!({"content": "正在生成图片，请稍等...\n\n"}),
+                    finish_reason: None,
+                }],
+                usage: None,
+            };
+            yield Ok(Event::default().data(serde_json::to_string(&status).unwrap()));
+
+            let result = state_for_stream
+                .gemini
+                .generate_web_image_output(&web_model, &prompt_for_stream)
+                .await;
+            let output_text = match result {
+                Ok(output) => match append_image_markdown(
+                    &state_for_stream,
+                    &headers_for_stream,
+                    output.text,
+                    &output.images,
+                )
+                .await
+                {
+                    Ok(output_text) => {
+                        state_for_stream.history.append(&HistoryRecord {
+                            ts: timestamp(),
+                            kind: "chat.completions.image_tool",
+                            model: &model_for_stream,
+                            prompt_chars: prompt_for_stream.chars().count(),
+                            output_chars: output_text.chars().count(),
+                            latency_ms: start.elapsed().as_millis(),
+                            ok: true,
+                            error: None,
+                        });
+                        output_text
+                    }
+                    Err(error) => {
+                        let detail = error.detail;
+                        state_for_stream.history.append(&HistoryRecord {
+                            ts: timestamp(),
+                            kind: "chat.completions.image_tool",
+                            model: &model_for_stream,
+                            prompt_chars: prompt_for_stream.chars().count(),
+                            output_chars: 0,
+                            latency_ms: start.elapsed().as_millis(),
+                            ok: false,
+                            error: Some(&detail),
+                        });
+                        format!("图片生成后保存失败：{detail}")
+                    }
+                },
+                Err(error) => {
+                    let detail = error.to_string();
+                    state_for_stream.history.append(&HistoryRecord {
+                        ts: timestamp(),
+                        kind: "chat.completions.image_tool",
+                        model: &model_for_stream,
+                        prompt_chars: prompt_for_stream.chars().count(),
+                        output_chars: 0,
+                        latency_ms: start.elapsed().as_millis(),
+                        ok: false,
+                        error: Some(&detail),
+                    });
+                    format!("图片生成失败：{detail}")
+                }
+            };
+            let processed = process_output(&output_text);
+            let visible = processed.visible_text.unwrap_or_default();
+            if !visible.is_empty() {
+                let content = StreamChunk {
+                    id: id.clone(),
+                    object: "chat.completion.chunk",
+                    created,
+                    model: model_for_stream.clone(),
+                    choices: vec![StreamChoice {
+                        index: 0,
+                        delta: json!({"content": visible}),
+                        finish_reason: None,
+                    }],
+                    usage: None,
+                };
+                yield Ok(Event::default().data(serde_json::to_string(&content).unwrap()));
+            }
+
+            let prompt_tokens = estimate_tokens(&prompt_for_stream);
+            let completion_tokens = estimate_tokens(&processed.storage_text);
+            let done = StreamChunk {
+                id,
+                object: "chat.completion.chunk",
+                created,
+                model: model_for_stream,
+                choices: vec![StreamChoice {
+                    index: 0,
+                    delta: json!({}),
+                    finish_reason: Some(processed.finish_reason),
+                }],
+                usage: Some(Usage {
+                    prompt_tokens,
+                    completion_tokens,
+                    total_tokens: prompt_tokens + completion_tokens,
+                    prompt_tokens_details: Some(json!({"cached_tokens": 0})),
+                    completion_tokens_details: Some(json!({"reasoning_tokens": 0})),
+                }),
+            };
+            yield Ok(Event::default().data(serde_json::to_string(&done).unwrap()));
+            yield Ok(Event::default().data("[DONE]"));
+        };
+        return Ok(Sse::new(s).into_response());
+    }
     let generated = if image_tool {
         state
             .gemini
