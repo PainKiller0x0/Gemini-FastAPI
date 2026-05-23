@@ -651,6 +651,17 @@ fn should_use_image_tool(state: &AppState, model: &str, prompt: &str) -> bool {
         || (prompt.contains('画') && (prompt.contains('图') || prompt.contains("图片")))
 }
 
+fn trace_id_from_headers(headers: &HeaderMap) -> String {
+    headers
+        .get("x-obp-request-id")
+        .or_else(|| headers.get("x-request-id"))
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .unwrap_or("-")
+        .to_string()
+}
+
 async fn chat_completions(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -672,7 +683,16 @@ async fn chat_completions(
     let completion_id = format!("chatcmpl-{}", Uuid::new_v4());
     let created = Utc::now().timestamp();
     let start = started();
+    let trace_id = trace_id_from_headers(&headers);
     let image_tool = should_use_image_tool(&state, &model_name, &prompt);
+    tracing::info!(
+        trace_id = %trace_id,
+        model = %model_name,
+        stream = request.stream.unwrap_or(false),
+        prompt_chars = prompt.chars().count(),
+        image_tool = image_tool,
+        "Gemini FastAPI chat request accepted"
+    );
     if image_tool && request.stream.unwrap_or(false) {
         let state_for_stream = state.clone();
         let headers_for_stream = headers.clone();
@@ -815,6 +835,7 @@ async fn chat_completions(
         let prompt_for_stream = prompt.clone();
         let attachments_for_stream = input.attachments.clone();
         let model_for_stream = model_name.clone();
+        let trace_for_stream = trace_id.clone();
         let id = completion_id.clone();
         let s = stream! {
             let role = StreamChunk {
@@ -844,12 +865,23 @@ async fn chat_completions(
                 std::time::Duration::from_secs(3),
             );
             let mut streamed_visible = String::new();
+            let mut first_delta_ms: Option<u128> = None;
             let mut progress_open = true;
             let generated = loop {
                 tokio::select! {
                     maybe_delta = progress_rx.recv(), if progress_open => {
                         match maybe_delta {
                             Some(delta) if !delta.is_empty() => {
+                                if first_delta_ms.is_none() {
+                                    let elapsed = start.elapsed().as_millis();
+                                    first_delta_ms = Some(elapsed);
+                                    tracing::info!(
+                                        trace_id = %trace_for_stream,
+                                        model = %model_for_stream,
+                                        first_text_delta_ms = elapsed,
+                                        "Gemini FastAPI first text delta"
+                                    );
+                                }
                                 streamed_visible.push_str(&delta);
                                 let content = StreamChunk {
                                     id: id.clone(),
