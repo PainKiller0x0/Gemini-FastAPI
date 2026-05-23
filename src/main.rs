@@ -184,6 +184,7 @@ async fn get_image(
 
 async fn append_image_markdown(
     state: &AppState,
+    headers: &HeaderMap,
     text: String,
     images: &[GeminiImage],
 ) -> Result<String, ApiError> {
@@ -198,17 +199,50 @@ async fn append_image_markdown(
     if saved.is_empty() {
         return Ok(text);
     }
-    let mut out = text;
+    let base_url = state
+        .config
+        .image_generation
+        .public_base_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.trim_end_matches('/').to_string())
+        .or_else(|| request_base_url(headers));
+    let mut out = if text.trim().is_empty() {
+        "已生成图片。".to_string()
+    } else {
+        text
+    };
     for image in saved {
         let token = image_token(&image.filename, state.config.server.api_key.as_deref())
             .map(|token| format!("?token={token}"))
             .unwrap_or_default();
+        let path = format!("/images/{}{}", image.filename, token);
+        let url = base_url
+            .as_ref()
+            .map(|base| format!("{base}{path}"))
+            .unwrap_or(path);
         out.push_str(&format!(
-            "\n\n![{}](/images/{}{})",
-            image.filename, image.filename, token
+            "\n\n![{}]({})\n\n[打开图片]({})",
+            image.filename, url, url
         ));
     }
     Ok(out)
+}
+
+fn request_base_url(headers: &HeaderMap) -> Option<String> {
+    let host = headers
+        .get("host")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    let proto = headers
+        .get("x-forwarded-proto")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("http");
+    Some(format!("{proto}://{host}"))
 }
 
 async fn save_generated_images(
@@ -422,6 +456,46 @@ fn image_token(filename: &str, api_key: Option<&str>) -> Option<String> {
     Some(digest[..24].to_string())
 }
 
+fn should_use_image_tool(state: &AppState, model: &str, prompt: &str) -> bool {
+    if !state.config.image_generation.is_enabled() {
+        return false;
+    }
+    let model = model.to_ascii_lowercase();
+    if model.contains("image") || model.contains("imagen") {
+        return true;
+    }
+    let prompt_lc = prompt.to_ascii_lowercase();
+    if [
+        "generate image",
+        "create image",
+        "make an image",
+        "draw an image",
+        "draw a picture",
+        "image of",
+        "picture of",
+    ]
+    .iter()
+    .any(|needle| prompt_lc.contains(needle))
+    {
+        return true;
+    }
+    let chinese_intent = [
+        "帮我画",
+        "画一张",
+        "画张",
+        "画个",
+        "生成图片",
+        "生成一张图",
+        "生成图",
+        "制作图片",
+        "生图",
+        "出图",
+        "绘制",
+    ];
+    chinese_intent.iter().any(|needle| prompt.contains(needle))
+        || (prompt.contains('画') && (prompt.contains('图') || prompt.contains("图片")))
+}
+
 async fn chat_completions(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -443,16 +517,29 @@ async fn chat_completions(
     let completion_id = format!("chatcmpl-{}", Uuid::new_v4());
     let created = Utc::now().timestamp();
     let start = started();
-    let output = match state
-        .gemini
-        .generate_output(&model_name, &prompt, &input.attachments)
-        .await
-    {
+    let image_tool = should_use_image_tool(&state, &model_name, &prompt);
+    let generated = if image_tool {
+        state
+            .gemini
+            .generate_web_image_output(&state.config.image_generation.web_model, &prompt)
+            .await
+    } else {
+        state
+            .gemini
+            .generate_output(&model_name, &prompt, &input.attachments)
+            .await
+    };
+    let output = match generated {
         Ok(output) => {
-            let output_text = append_image_markdown(&state, output.text, &output.images).await?;
+            let output_text =
+                append_image_markdown(&state, &headers, output.text, &output.images).await?;
             state.history.append(&HistoryRecord {
                 ts: timestamp(),
-                kind: "chat.completions",
+                kind: if image_tool {
+                    "chat.completions.image_tool"
+                } else {
+                    "chat.completions"
+                },
                 model: &model_name,
                 prompt_chars: prompt.chars().count(),
                 output_chars: output_text.chars().count(),
@@ -466,7 +553,11 @@ async fn chat_completions(
             let detail = error.to_string();
             state.history.append(&HistoryRecord {
                 ts: timestamp(),
-                kind: "chat.completions",
+                kind: if image_tool {
+                    "chat.completions.image_tool"
+                } else {
+                    "chat.completions"
+                },
                 model: &model_name,
                 prompt_chars: prompt.chars().count(),
                 output_chars: 0,
@@ -618,16 +709,29 @@ async fn create_response(
     let response_id = format!("resp_{}", Uuid::new_v4());
     let created = Utc::now().timestamp();
     let start = started();
-    let output = match state
-        .gemini
-        .generate_output(&request.model, &prompt, &input.attachments)
-        .await
-    {
+    let image_tool = should_use_image_tool(&state, &request.model, &prompt);
+    let generated = if image_tool {
+        state
+            .gemini
+            .generate_web_image_output(&state.config.image_generation.web_model, &prompt)
+            .await
+    } else {
+        state
+            .gemini
+            .generate_output(&request.model, &prompt, &input.attachments)
+            .await
+    };
+    let output = match generated {
         Ok(output) => {
-            let output_text = append_image_markdown(&state, output.text, &output.images).await?;
+            let output_text =
+                append_image_markdown(&state, &headers, output.text, &output.images).await?;
             state.history.append(&HistoryRecord {
                 ts: timestamp(),
-                kind: "responses",
+                kind: if image_tool {
+                    "responses.image_tool"
+                } else {
+                    "responses"
+                },
                 model: &request.model,
                 prompt_chars: prompt.chars().count(),
                 output_chars: output_text.chars().count(),
@@ -641,7 +745,11 @@ async fn create_response(
             let detail = error.to_string();
             state.history.append(&HistoryRecord {
                 ts: timestamp(),
-                kind: "responses",
+                kind: if image_tool {
+                    "responses.image_tool"
+                } else {
+                    "responses"
+                },
                 model: &request.model,
                 prompt_chars: prompt.chars().count(),
                 output_chars: 0,

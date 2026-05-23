@@ -480,6 +480,7 @@ impl GeminiClient {
         }
         add_web_required_headers(&mut request_headers);
         if image_mode {
+            add_image_tool_browser_headers(&mut request_headers);
             request_headers.insert(
                 "x-goog-ext-73010990-jspb",
                 HeaderValue::from_static("[0,0,0]"),
@@ -1101,6 +1102,36 @@ fn add_web_required_headers(headers: &mut HeaderMap) {
     headers
         .entry("x-goog-ext-73010990-jspb")
         .or_insert(HeaderValue::from_static("[0]"));
+}
+
+fn add_image_tool_browser_headers(headers: &mut HeaderMap) {
+    // Gemini Web image tools are more sensitive to browser fingerprint headers
+    // than normal chat. These mirror the captured StreamGenerate request shape.
+    let values = [
+        ("accept", "*/*"),
+        ("accept-language", "zh-CN,zh;q=0.9"),
+        (
+            "user-agent",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36",
+        ),
+        ("x-browser-channel", "stable"),
+        (
+            "x-browser-copyright",
+            "Copyright 2026 Google LLC. All Rights Reserved.",
+        ),
+        ("x-browser-validation", "puPtlXuojC+VILE1bgaJ40YGt+E="),
+        ("x-browser-year", "2026"),
+        ("sec-fetch-dest", "empty"),
+        ("sec-fetch-mode", "cors"),
+        ("sec-fetch-site", "same-origin"),
+        ("sec-ch-ua-mobile", "?0"),
+        ("sec-ch-ua-platform", "\"Windows\""),
+    ];
+    for (name, value) in values {
+        if let Ok(header_value) = HeaderValue::from_str(value) {
+            headers.insert(name, header_value);
+        }
+    }
 }
 
 fn image_mode_model_header(model: &GeminiModel, request_uuid: &str) -> Option<String> {
