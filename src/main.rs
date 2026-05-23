@@ -4,7 +4,9 @@ mod history;
 mod images;
 mod openai;
 
-use std::{collections::HashMap, path::Path as FsPath, sync::Arc};
+use std::{
+    collections::HashMap, env, fs as std_fs, path::Path as FsPath, sync::Arc, time::UNIX_EPOCH,
+};
 
 use async_stream::stream;
 use axum::{
@@ -17,7 +19,10 @@ use axum::{
 use base64::{Engine as _, engine::general_purpose};
 use chrono::Utc;
 use config::Config;
-use gemini::{GeminiImage, GeminiPool};
+use gemini::{
+    GeminiImage, GeminiPool, extract_cookie_header_from_text, extract_web_tool_nonce_from_text,
+    short_fingerprint,
+};
 use history::{HistoryRecord, HistoryStore, started, timestamp};
 use images::{ImageData, ImageGenerationRequest, ImageGenerationResponse};
 use openai::{
@@ -73,12 +78,17 @@ async fn main() -> anyhow::Result<()> {
 
     let app = Router::new()
         .route("/health", get(health))
+        .route(
+            "/admin/session",
+            get(admin_session_status).post(admin_session_reload),
+        )
+        .route("/admin/session/reload", post(admin_session_reload))
         .route("/v1/models", get(list_models))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/responses", post(create_response))
         .route("/v1/images/generations", post(image_generations))
         .route("/images/{filename}", get(get_image))
-        .layer(CorsLayer::permissive())
+        .layer(CorsLayer::permissive().allow_private_network(true))
         .layer(TraceLayer::new_for_http())
         .with_state(state);
 
@@ -95,6 +105,124 @@ async fn health(State(state): State<Arc<AppState>>) -> Json<Value> {
         "implementation": "rust",
         "clients": state.gemini.client_ids(),
     }))
+}
+
+async fn admin_session_status(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    verify_auth(&state, &headers)?;
+    Ok(Json(json!({
+        "ok": true,
+        "clients": state.gemini.session_status().await,
+        "files": {
+            "cookie": runtime_file_status("GEMINI_COOKIE_FILE"),
+            "web_tool_nonce": runtime_file_status("GEMINI_WEB_TOOL_NONCE_FILE"),
+        }
+    })))
+}
+
+async fn admin_session_reload(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(payload): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    verify_auth(&state, &headers)?;
+    let text = payload.get("text").and_then(Value::as_str).unwrap_or("");
+    let cookie = payload
+        .get("cookie")
+        .and_then(Value::as_str)
+        .and_then(extract_cookie_header_from_text)
+        .or_else(|| extract_cookie_header_from_text(text));
+    let web_tool_nonce = payload
+        .get("web_tool_nonce")
+        .or_else(|| payload.get("tool_nonce"))
+        .and_then(Value::as_str)
+        .and_then(extract_web_tool_nonce_from_text)
+        .or_else(|| extract_web_tool_nonce_from_text(text));
+
+    let mut updated = serde_json::Map::new();
+    if let Some(cookie) = cookie {
+        let path = env::var("GEMINI_COOKIE_FILE").map_err(|_| {
+            ApiError::bad_request("GEMINI_COOKIE_FILE is not configured; cannot hot-update cookie")
+        })?;
+        tokio::fs::write(&path, format!("{cookie}\n"))
+            .await
+            .map_err(|error| ApiError::from(anyhow::anyhow!(error)))?;
+        updated.insert(
+            "cookie".to_string(),
+            json!({"path": path, "len": cookie.len(), "sha256": short_fingerprint(&cookie)}),
+        );
+    }
+    if let Some(web_tool_nonce) = web_tool_nonce {
+        let path = env::var("GEMINI_WEB_TOOL_NONCE_FILE").map_err(|_| {
+            ApiError::bad_request(
+                "GEMINI_WEB_TOOL_NONCE_FILE is not configured; cannot hot-update web tool nonce",
+            )
+        })?;
+        tokio::fs::write(&path, format!("{web_tool_nonce}\n"))
+            .await
+            .map_err(|error| ApiError::from(anyhow::anyhow!(error)))?;
+        updated.insert(
+            "web_tool_nonce".to_string(),
+            json!({
+                "path": path,
+                "len": web_tool_nonce.len(),
+                "sha256": short_fingerprint(&web_tool_nonce),
+            }),
+        );
+    }
+    if updated.is_empty() {
+        return Err(ApiError::bad_request(
+            "no cookie or web_tool_nonce found in request payload",
+        ));
+    }
+
+    state.gemini.clear_sessions().await;
+    let verify = payload
+        .get("verify")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let verify_result = if verify {
+        match state.gemini.refresh_sessions().await {
+            Ok(()) => json!({"ok": true}),
+            Err(error) => json!({"ok": false, "error": error.to_string()}),
+        }
+    } else {
+        json!({"ok": null, "skipped": true})
+    };
+
+    Ok(Json(json!({
+        "ok": true,
+        "updated": updated,
+        "session_verify": verify_result,
+        "clients": state.gemini.session_status().await,
+        "files": {
+            "cookie": runtime_file_status("GEMINI_COOKIE_FILE"),
+            "web_tool_nonce": runtime_file_status("GEMINI_WEB_TOOL_NONCE_FILE"),
+        }
+    })))
+}
+
+fn runtime_file_status(env_name: &str) -> Value {
+    let Ok(path) = env::var(env_name) else {
+        return json!({"configured": false});
+    };
+    let metadata = std_fs::metadata(&path).ok();
+    let content = std_fs::read_to_string(&path).ok();
+    let modified_unix = metadata
+        .as_ref()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_secs());
+    json!({
+        "configured": true,
+        "path": path,
+        "exists": metadata.is_some(),
+        "len": metadata.as_ref().map(|m| m.len()),
+        "modified_unix": modified_unix,
+        "sha256": content.as_deref().map(short_fingerprint),
+    })
 }
 
 async fn list_models(
@@ -208,10 +336,11 @@ async fn append_image_markdown(
         .filter(|s| !s.is_empty())
         .map(|s| s.trim_end_matches('/').to_string())
         .or_else(|| request_base_url(headers));
-    let mut out = if text.trim().is_empty() {
-        "已生成图片。".to_string()
+    let cleaned_text = strip_generated_image_placeholders(&text);
+    let mut out = if cleaned_text.trim().is_empty() {
+        "Image generated.".to_string()
     } else {
-        text
+        cleaned_text
     };
     for image in saved {
         let token = image_token(&image.filename, state.config.server.api_key.as_deref())
@@ -228,6 +357,32 @@ async fn append_image_markdown(
         ));
     }
     Ok(out)
+}
+
+fn strip_generated_image_placeholders(text: &str) -> String {
+    text.lines()
+        .filter(|line| {
+            let trimmed = line.trim();
+            !(trimmed.starts_with("http://googleusercontent.com/image_generation_content/")
+                || trimmed.starts_with("https://googleusercontent.com/image_generation_content/"))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string()
+}
+
+fn stream_tail<'a>(streamed: &str, final_text: &'a str) -> Option<&'a str> {
+    if final_text.is_empty() {
+        None
+    } else if streamed.is_empty() {
+        Some(final_text)
+    } else if final_text.starts_with(streamed) {
+        let tail = &final_text[streamed.len()..];
+        (!tail.is_empty()).then_some(tail)
+    } else {
+        None
+    }
 }
 
 fn request_base_url(headers: &HeaderMap) -> Option<String> {
@@ -540,48 +695,50 @@ async fn chat_completions(
             };
             yield Ok::<_, std::convert::Infallible>(Event::default().data(serde_json::to_string(&role).unwrap()));
 
-            let status = StreamChunk {
-                id: id.clone(),
-                object: "chat.completion.chunk",
-                created,
-                model: model_for_stream.clone(),
-                choices: vec![StreamChoice {
-                    index: 0,
-                    delta: json!({"content": "正在生成图片，请稍等...\n\n"}),
-                    finish_reason: None,
-                }],
-                usage: None,
-            };
-            yield Ok(Event::default().data(serde_json::to_string(&status).unwrap()));
-
-            let result = state_for_stream
-                .gemini
-                .generate_web_image_output(&web_model, &prompt_for_stream)
-                .await;
-            let output_text = match result {
-                Ok(output) => match append_image_markdown(
-                    &state_for_stream,
-                    &headers_for_stream,
-                    output.text,
-                    &output.images,
-                )
-                .await
-                {
-                    Ok(output_text) => {
-                        state_for_stream.history.append(&HistoryRecord {
-                            ts: timestamp(),
-                            kind: "chat.completions.image_tool",
-                            model: &model_for_stream,
-                            prompt_chars: prompt_for_stream.chars().count(),
-                            output_chars: output_text.chars().count(),
-                            latency_ms: start.elapsed().as_millis(),
-                            ok: true,
-                            error: None,
-                        });
-                        output_text
-                    }
+            let image_job = async {
+                let result = state_for_stream
+                    .gemini
+                    .generate_web_image_output(&web_model, &prompt_for_stream)
+                    .await;
+                match result {
+                    Ok(output) => match append_image_markdown(
+                        &state_for_stream,
+                        &headers_for_stream,
+                        output.text,
+                        &output.images,
+                    )
+                    .await
+                    {
+                        Ok(output_text) => {
+                            state_for_stream.history.append(&HistoryRecord {
+                                ts: timestamp(),
+                                kind: "chat.completions.image_tool",
+                                model: &model_for_stream,
+                                prompt_chars: prompt_for_stream.chars().count(),
+                                output_chars: output_text.chars().count(),
+                                latency_ms: start.elapsed().as_millis(),
+                                ok: true,
+                                error: None,
+                            });
+                            output_text
+                        }
+                        Err(error) => {
+                            let detail = error.detail;
+                            state_for_stream.history.append(&HistoryRecord {
+                                ts: timestamp(),
+                                kind: "chat.completions.image_tool",
+                                model: &model_for_stream,
+                                prompt_chars: prompt_for_stream.chars().count(),
+                                output_chars: 0,
+                                latency_ms: start.elapsed().as_millis(),
+                                ok: false,
+                                error: Some(&detail),
+                            });
+                            format!("图片生成后保存失败：{detail}")
+                        }
+                    },
                     Err(error) => {
-                        let detail = error.detail;
+                        let detail = error.to_string();
                         state_for_stream.history.append(&HistoryRecord {
                             ts: timestamp(),
                             kind: "chat.completions.image_tool",
@@ -592,22 +749,33 @@ async fn chat_completions(
                             ok: false,
                             error: Some(&detail),
                         });
-                        format!("图片生成后保存失败：{detail}")
+                        format!("图片生成失败：{detail}")
                     }
-                },
-                Err(error) => {
-                    let detail = error.to_string();
-                    state_for_stream.history.append(&HistoryRecord {
-                        ts: timestamp(),
-                        kind: "chat.completions.image_tool",
-                        model: &model_for_stream,
-                        prompt_chars: prompt_for_stream.chars().count(),
-                        output_chars: 0,
-                        latency_ms: start.elapsed().as_millis(),
-                        ok: false,
-                        error: Some(&detail),
-                    });
-                    format!("图片生成失败：{detail}")
+                }
+            };
+            tokio::pin!(image_job);
+            let mut heartbeat = tokio::time::interval_at(
+                tokio::time::Instant::now() + std::time::Duration::from_secs(5),
+                std::time::Duration::from_secs(5),
+            );
+            let output_text = loop {
+                tokio::select! {
+                    output_text = &mut image_job => break output_text,
+                    _ = heartbeat.tick() => {
+                        let keepalive = StreamChunk {
+                            id: id.clone(),
+                            object: "chat.completion.chunk",
+                            created,
+                            model: model_for_stream.clone(),
+                            choices: vec![StreamChoice {
+                                index: 0,
+                                delta: json!({"content": "\u{200b}"}),
+                                finish_reason: None,
+                            }],
+                            usage: None,
+                        };
+                        yield Ok(Event::default().data(serde_json::to_string(&keepalive).unwrap()));
+                    }
                 }
             };
             let processed = process_output(&output_text);
@@ -634,7 +802,7 @@ async fn chat_completions(
                 id,
                 object: "chat.completion.chunk",
                 created,
-                model: model_for_stream,
+                model: model_for_stream.clone(),
                 choices: vec![StreamChoice {
                     index: 0,
                     delta: json!({}),
@@ -653,6 +821,210 @@ async fn chat_completions(
         };
         return Ok(Sse::new(s).into_response());
     }
+    if request.stream.unwrap_or(false) {
+        let state_for_stream = state.clone();
+        let headers_for_stream = headers.clone();
+        let prompt_for_stream = prompt.clone();
+        let attachments_for_stream = input.attachments.clone();
+        let model_for_stream = model_name.clone();
+        let id = completion_id.clone();
+        let s = stream! {
+            let role = StreamChunk {
+                id: id.clone(),
+                object: "chat.completion.chunk",
+                created,
+                model: model_for_stream.clone(),
+                choices: vec![StreamChoice {
+                    index: 0,
+                    delta: json!({"role": "assistant"}),
+                    finish_reason: None,
+                }],
+                usage: None,
+            };
+            yield Ok::<_, std::convert::Infallible>(Event::default().data(serde_json::to_string(&role).unwrap()));
+
+            let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+            let generate_job = state_for_stream.gemini.generate_output_with_progress(
+                &model_for_stream,
+                &prompt_for_stream,
+                &attachments_for_stream,
+                Some(progress_tx),
+            );
+            tokio::pin!(generate_job);
+            let mut heartbeat = tokio::time::interval_at(
+                tokio::time::Instant::now() + std::time::Duration::from_secs(3),
+                std::time::Duration::from_secs(3),
+            );
+            let mut streamed_visible = String::new();
+            let mut progress_open = true;
+            let generated = loop {
+                tokio::select! {
+                    maybe_delta = progress_rx.recv(), if progress_open => {
+                        match maybe_delta {
+                            Some(delta) if !delta.is_empty() => {
+                                streamed_visible.push_str(&delta);
+                                let content = StreamChunk {
+                                    id: id.clone(),
+                                    object: "chat.completion.chunk",
+                                    created,
+                                    model: model_for_stream.clone(),
+                                    choices: vec![StreamChoice {
+                                        index: 0,
+                                        delta: json!({"content": delta}),
+                                        finish_reason: None,
+                                    }],
+                                    usage: None,
+                                };
+                                yield Ok(Event::default().data(serde_json::to_string(&content).unwrap()));
+                            }
+                            Some(_) => {}
+                            None => progress_open = false,
+                        }
+                    }
+                    result = &mut generate_job => break result,
+                    _ = heartbeat.tick() => {
+                        let keepalive = StreamChunk {
+                            id: id.clone(),
+                            object: "chat.completion.chunk",
+                            created,
+                            model: model_for_stream.clone(),
+                            choices: vec![StreamChoice {
+                                index: 0,
+                                delta: json!({"content": "\u{200b}"}),
+                                finish_reason: None,
+                            }],
+                            usage: None,
+                        };
+                        yield Ok(Event::default().data(serde_json::to_string(&keepalive).unwrap()));
+                    }
+                }
+            };
+
+            let (output_text, force_final_visible) = match generated {
+                Ok(output) => match append_image_markdown(
+                    &state_for_stream,
+                    &headers_for_stream,
+                    output.text,
+                    &output.images,
+                )
+                .await
+                {
+                    Ok(output_text) => {
+                        state_for_stream.history.append(&HistoryRecord {
+                            ts: timestamp(),
+                            kind: "chat.completions",
+                            model: &model_for_stream,
+                            prompt_chars: prompt_for_stream.chars().count(),
+                            output_chars: output_text.chars().count(),
+                            latency_ms: start.elapsed().as_millis(),
+                            ok: true,
+                            error: None,
+                        });
+                        (output_text, false)
+                    }
+                    Err(error) => {
+                        let detail = error.detail;
+                        state_for_stream.history.append(&HistoryRecord {
+                            ts: timestamp(),
+                            kind: "chat.completions",
+                            model: &model_for_stream,
+                            prompt_chars: prompt_for_stream.chars().count(),
+                            output_chars: 0,
+                            latency_ms: start.elapsed().as_millis(),
+                            ok: false,
+                            error: Some(&detail),
+                        });
+                        (format!("Gemini response postprocess failed: {detail}"), true)
+                    }
+                },
+                Err(error) => {
+                    let detail = error.to_string();
+                    state_for_stream.history.append(&HistoryRecord {
+                        ts: timestamp(),
+                        kind: "chat.completions",
+                        model: &model_for_stream,
+                        prompt_chars: prompt_for_stream.chars().count(),
+                        output_chars: 0,
+                        latency_ms: start.elapsed().as_millis(),
+                        ok: false,
+                        error: Some(&detail),
+                    });
+                    (format!("Gemini request failed: {detail}"), true)
+                }
+            };
+            let processed = process_output(&output_text);
+            let final_visible = processed.visible_text.clone().unwrap_or_default();
+            let visible_tail = if force_final_visible {
+                final_visible.as_str()
+            } else {
+                stream_tail(&streamed_visible, &final_visible).unwrap_or("")
+            };
+            if !visible_tail.is_empty() {
+                let content = StreamChunk {
+                    id: id.clone(),
+                    object: "chat.completion.chunk",
+                    created,
+                    model: model_for_stream.clone(),
+                    choices: vec![StreamChoice {
+                        index: 0,
+                        delta: json!({"content": visible_tail}),
+                        finish_reason: None,
+                    }],
+                    usage: None,
+                };
+                yield Ok(Event::default().data(serde_json::to_string(&content).unwrap()));
+            }
+
+            if !processed.tool_calls.is_empty() {
+                let tool_delta = processed.tool_calls.iter().enumerate().map(|(index, call)| {
+                    json!({
+                        "index": index,
+                        "id": &call.id,
+                        "type": &call.kind,
+                        "function": &call.function,
+                    })
+                }).collect::<Vec<_>>();
+                let tools = StreamChunk {
+                    id: id.clone(),
+                    object: "chat.completion.chunk",
+                    created,
+                    model: model_for_stream.clone(),
+                    choices: vec![StreamChoice {
+                        index: 0,
+                        delta: json!({"tool_calls": tool_delta}),
+                        finish_reason: None,
+                    }],
+                    usage: None,
+                };
+                yield Ok(Event::default().data(serde_json::to_string(&tools).unwrap()));
+            }
+
+            let prompt_tokens = estimate_tokens(&prompt_for_stream);
+            let completion_tokens = estimate_tokens(&processed.storage_text);
+            let done = StreamChunk {
+                id,
+                object: "chat.completion.chunk",
+                created,
+                model: model_for_stream.clone(),
+                choices: vec![StreamChoice {
+                    index: 0,
+                    delta: json!({}),
+                    finish_reason: Some(processed.finish_reason),
+                }],
+                usage: Some(Usage {
+                    prompt_tokens,
+                    completion_tokens,
+                    total_tokens: prompt_tokens + completion_tokens,
+                    prompt_tokens_details: Some(json!({"cached_tokens": 0})),
+                    completion_tokens_details: Some(json!({"reasoning_tokens": 0})),
+                }),
+            };
+            yield Ok(Event::default().data(serde_json::to_string(&done).unwrap()));
+            yield Ok(Event::default().data("[DONE]"));
+        };
+        return Ok(Sse::new(s).into_response());
+    }
+
     let generated = if image_tool {
         state
             .gemini

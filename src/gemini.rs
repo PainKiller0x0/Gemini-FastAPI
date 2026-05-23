@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    env, fs,
     path::Path,
     sync::{
         Arc,
@@ -9,7 +10,9 @@ use std::{
 };
 
 use anyhow::{Context, anyhow};
+use base64::{Engine as _, engine::general_purpose};
 use chrono::Utc;
+use futures_util::StreamExt;
 use once_cell::sync::Lazy;
 use regex::Regex;
 use reqwest::{
@@ -19,7 +22,7 @@ use reqwest::{
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, mpsc};
 use uuid::Uuid;
 
 use crate::config::{GeminiClientConfig, GeminiModelConfig};
@@ -38,6 +41,12 @@ static LANG_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r#"\"TuX5cc\":\s*\"(.*?)\"
 static PUSH_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r#"\"qKIAYe\":\s*\"(.*?)\""#).unwrap());
 static BARD_ERROR_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r#"BardErrorInfo\\",\[(\d+)\]"#).unwrap());
+static CURL_COOKIE_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r#"(?is)(?:^|\s)(?:-b|--cookie)\s+["']([^"']+)["']"#).unwrap());
+static COOKIE_HEADER_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r#"(?im)^\s*cookie\s*:\s*(.+?)\s*$"#).unwrap());
+static WEB_TOOL_NONCE_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r#"![-_A-Za-z0-9]{1000,}"#).unwrap());
 
 #[derive(Debug, Clone)]
 pub struct GeminiModel {
@@ -171,6 +180,17 @@ impl GeminiPool {
         prompt: &str,
         attachments: &[InputAttachment],
     ) -> anyhow::Result<GeminiOutput> {
+        self.generate_output_with_progress(model_name, prompt, attachments, None)
+            .await
+    }
+
+    pub async fn generate_output_with_progress(
+        &self,
+        model_name: &str,
+        prompt: &str,
+        attachments: &[InputAttachment],
+        progress: Option<mpsc::UnboundedSender<String>>,
+    ) -> anyhow::Result<GeminiOutput> {
         let len = self.clients.len();
         let start = self.cursor.fetch_add(1, Ordering::Relaxed) % len;
         let mut last_error = None;
@@ -178,7 +198,7 @@ impl GeminiPool {
             let index = (start + offset) % len;
             let client = &self.clients[index];
             match client
-                .generate_output(model_name, prompt, attachments)
+                .generate_output_with_progress(model_name, prompt, attachments, progress.clone())
                 .await
             {
                 Ok(output) => return Ok(output),
@@ -231,6 +251,36 @@ impl GeminiPool {
             .first()
             .context("at least one Gemini client is required")?;
         client.save_images(images, dir).await
+    }
+
+    pub async fn clear_sessions(&self) {
+        for client in &self.clients {
+            client.clear_session().await;
+        }
+    }
+
+    pub async fn refresh_sessions(&self) -> anyhow::Result<()> {
+        let mut ok_count = 0usize;
+        let mut last_error = None;
+        for client in &self.clients {
+            match client.reset_and_refresh_session().await {
+                Ok(()) => ok_count += 1,
+                Err(error) => last_error = Some(error),
+            }
+        }
+        if ok_count > 0 {
+            Ok(())
+        } else {
+            Err(last_error.unwrap_or_else(|| anyhow!("all Gemini sessions failed to refresh")))
+        }
+    }
+
+    pub async fn session_status(&self) -> Vec<Value> {
+        let mut status = Vec::new();
+        for client in &self.clients {
+            status.push(client.session_status().await);
+        }
+        status
     }
 }
 
@@ -377,7 +427,18 @@ impl GeminiClient {
         prompt: &str,
         attachments: &[InputAttachment],
     ) -> anyhow::Result<GeminiOutput> {
-        self.generate_output_inner(model_name, prompt, attachments, false)
+        self.generate_output_with_progress(model_name, prompt, attachments, None)
+            .await
+    }
+
+    pub async fn generate_output_with_progress(
+        &self,
+        model_name: &str,
+        prompt: &str,
+        attachments: &[InputAttachment],
+        progress: Option<mpsc::UnboundedSender<String>>,
+    ) -> anyhow::Result<GeminiOutput> {
+        self.generate_output_inner(model_name, prompt, attachments, false, progress)
             .await
     }
 
@@ -386,7 +447,7 @@ impl GeminiClient {
         model_name: &str,
         prompt: &str,
     ) -> anyhow::Result<GeminiOutput> {
-        self.generate_output_inner(model_name, prompt, &[], true)
+        self.generate_output_inner(model_name, prompt, &[], true, None)
             .await
     }
 
@@ -396,6 +457,7 @@ impl GeminiClient {
         prompt: &str,
         attachments: &[InputAttachment],
         image_mode: bool,
+        progress: Option<mpsc::UnboundedSender<String>>,
     ) -> anyhow::Result<GeminiOutput> {
         if prompt.trim().is_empty() {
             return Err(anyhow!("prompt cannot be empty"));
@@ -426,7 +488,9 @@ impl GeminiClient {
 
         let reqid = self.reqid.fetch_add(100_000, Ordering::Relaxed);
         let uuid = Uuid::new_v4().to_string().to_uppercase();
-        let language = if session.language.is_empty() {
+        let language: &str = if image_mode {
+            "zh-CN"
+        } else if session.language.is_empty() {
             "en"
         } else {
             &session.language
@@ -441,7 +505,7 @@ impl GeminiClient {
         inner[10] = json!(1);
         inner[11] = json!(0);
         inner[17] = if image_mode {
-            json!([[22]])
+            json!([[0]])
         } else {
             json!([[0]])
         };
@@ -486,7 +550,7 @@ impl GeminiClient {
                 HeaderValue::from_static("[0,0,0]"),
             );
             if let Some(header) =
-                image_mode_model_header(&model, &Uuid::new_v4().to_string().to_uppercase())
+                image_mode_model_header(&model, "F037BA73-BD98-4D15-8073-AE6F4E0BB60E")
             {
                 request_headers
                     .insert("x-goog-ext-525001261-jspb", HeaderValue::from_str(&header)?);
@@ -511,6 +575,7 @@ impl GeminiClient {
             ("f.req", f_req.as_str()),
         ];
 
+        let request_started = Instant::now();
         let response = self
             .http
             .post(ENDPOINT_GENERATE)
@@ -520,6 +585,13 @@ impl GeminiClient {
             .form(&form)
             .send()
             .await?;
+        tracing::info!(
+            client = self.id(),
+            model = model_name,
+            prompt_chars = prompt.chars().count(),
+            headers_ms = request_started.elapsed().as_millis(),
+            "Gemini generate response headers received"
+        );
 
         if !response.status().is_success() {
             let status = response.status();
@@ -531,7 +603,14 @@ impl GeminiClient {
             ));
         }
 
-        let raw = response.text().await?;
+        let raw = read_response_text_with_progress(
+            response,
+            progress,
+            self.id(),
+            model_name,
+            request_started,
+        )
+        .await?;
         extract_output_from_response(&raw)
     }
 
@@ -1029,15 +1108,60 @@ impl GeminiClient {
         Ok(())
     }
 
+    async fn clear_session(&self) {
+        *self.session.lock().await = None;
+    }
+
+    async fn reset_and_refresh_session(&self) -> anyhow::Result<()> {
+        self.clear_session().await;
+        self.ensure_session().await
+    }
+
+    async fn session_status(&self) -> Value {
+        let session = self.session.lock().await;
+        let (cookie_header, cookie_source) = self.cookie_header_with_source();
+        json!({
+            "id": self.id(),
+            "session_cached": session.is_some(),
+            "session_age_seconds": session.as_ref().map(|s| s.created_at.elapsed().as_secs()),
+            "cookie_source": cookie_source,
+            "cookie_len": cookie_header.len(),
+            "cookie_sha256": short_fingerprint(&cookie_header),
+            "cookie_has_full_header": cookie_header.contains("SAPISID=") || cookie_header.contains("__Secure-3PSID="),
+            "cookie_has_1psid": cookie_header.contains("__Secure-1PSID="),
+            "cookie_has_1psidts": cookie_header.contains("__Secure-1PSIDTS="),
+            "cookie_has_1psidcc": cookie_header.contains("__Secure-1PSIDCC="),
+        })
+    }
+
     fn cookie_header(&self) -> String {
+        self.cookie_header_with_source().0
+    }
+
+    fn cookie_header_with_source(&self) -> (String, String) {
+        if let Some(value) = env::var("GEMINI_COOKIE_HEADER")
+            .ok()
+            .and_then(|s| normalise_cookie_value(&s))
+        {
+            return (value, "env:GEMINI_COOKIE_HEADER".to_string());
+        }
+        if let Some((value, source)) = env::var("GEMINI_COOKIE_FILE").ok().and_then(|path| {
+            read_cookie_file(&path).map(|value| (value, format!("env-file:{path}")))
+        }) {
+            return (value, source);
+        }
+        if let Some((value, source)) = self.client_config.cookie_file.as_deref().and_then(|path| {
+            read_cookie_file(path).map(|value| (value, format!("client-file:{path}")))
+        }) {
+            return (value, source);
+        }
         if let Some(value) = self
             .client_config
             .cookie_header
             .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
+            .and_then(normalise_cookie_value)
         {
-            return value.to_string();
+            return (value, "config:cookie_header".to_string());
         }
         let mut parts = vec![
             format!("__Secure-1PSID={}", self.client_config.secure_1psid),
@@ -1051,7 +1175,104 @@ impl GeminiClient {
         {
             parts.push(format!("__Secure-1PSIDCC={value}"));
         }
-        parts.join("; ")
+        (parts.join("; "), "config:minimal_cookies".to_string())
+    }
+}
+
+pub fn extract_cookie_header_from_text(text: &str) -> Option<String> {
+    let normalised = text.replace("^\"", "\"").replace('^', "");
+    if let Some(capture) = COOKIE_HEADER_RE.captures(&normalised) {
+        if let Some(value) = normalise_cookie_value(capture.get(1)?.as_str()) {
+            return Some(value);
+        }
+    }
+    if let Some(capture) = CURL_COOKIE_RE.captures(&normalised) {
+        if let Some(value) = normalise_cookie_value(capture.get(1)?.as_str()) {
+            return Some(value);
+        }
+    }
+    fallback_cookie_header(&normalised)
+}
+
+pub fn extract_web_tool_nonce_from_text(text: &str) -> Option<String> {
+    let normalised = text.replace('^', "");
+    if let Some(value) = WEB_TOOL_NONCE_RE.find(&normalised) {
+        return Some(value.as_str().to_string());
+    }
+    let decoded = percent_decode_lossy(&normalised);
+    WEB_TOOL_NONCE_RE
+        .find(&decoded)
+        .map(|m| m.as_str().to_string())
+}
+
+pub fn short_fingerprint(text: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(text.as_bytes());
+    format!("{:x}", hasher.finalize())[..16].to_string()
+}
+
+fn read_cookie_file(path: &str) -> Option<String> {
+    let raw = fs::read_to_string(path).ok()?;
+    extract_cookie_header_from_text(&raw).or_else(|| normalise_cookie_value(&raw))
+}
+
+fn normalise_cookie_value(value: &str) -> Option<String> {
+    let mut value = value
+        .replace("\\\"", "\"")
+        .replace("^\"", "\"")
+        .replace('^', "")
+        .trim()
+        .trim_matches('"')
+        .trim_matches('\'')
+        .trim()
+        .to_string();
+    if value.to_ascii_lowercase().starts_with("cookie:") {
+        value = value[7..].trim().to_string();
+    }
+    if value.contains("__Secure-1PSID=") && value.contains("__Secure-1PSIDTS=") {
+        Some(value)
+    } else {
+        None
+    }
+}
+
+fn fallback_cookie_header(text: &str) -> Option<String> {
+    let idx = text.find("__Secure-1PSID=")?;
+    let start = text[..idx]
+        .rfind(|c| matches!(c, '"' | '\n' | '\r'))
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    let end = text[idx..]
+        .find(|c| matches!(c, '"' | '\n' | '\r'))
+        .map(|i| idx + i)
+        .unwrap_or(text.len());
+    normalise_cookie_value(&text[start..end])
+}
+
+fn percent_decode_lossy(input: &str) -> String {
+    let mut out = Vec::with_capacity(input.len());
+    let bytes = input.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(hi), Some(lo)) = (hex_value(bytes[i + 1]), hex_value(bytes[i + 2])) {
+                out.push((hi << 4) | lo);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn hex_value(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        b'A'..=b'F' => Some(value - b'A' + 10),
+        _ => None,
     }
 }
 
@@ -1124,8 +1345,25 @@ fn add_image_tool_browser_headers(headers: &mut HeaderMap) {
         ("sec-fetch-dest", "empty"),
         ("sec-fetch-mode", "cors"),
         ("sec-fetch-site", "same-origin"),
+        ("dnt", "1"),
+        ("priority", "u=1, i"),
+        (
+            "sec-ch-ua",
+            "\"Chromium\";v=\"148\", \"Google Chrome\";v=\"148\", \"Not/A)Brand\";v=\"99\"",
+        ),
+        ("sec-ch-ua-arch", "\"x86\""),
+        ("sec-ch-ua-bitness", "\"64\""),
+        ("sec-ch-ua-form-factors", "\"Desktop\""),
+        ("sec-ch-ua-full-version", "\"148.0.7778.168\""),
+        (
+            "sec-ch-ua-full-version-list",
+            "\"Chromium\";v=\"148.0.7778.168\", \"Google Chrome\";v=\"148.0.7778.168\", \"Not/A)Brand\";v=\"99.0.0.0\"",
+        ),
         ("sec-ch-ua-mobile", "?0"),
+        ("sec-ch-ua-model", "\"\""),
         ("sec-ch-ua-platform", "\"Windows\""),
+        ("sec-ch-ua-platform-version", "\"10.0.0\""),
+        ("sec-ch-ua-wow64", "?0"),
     ];
     for (name, value) in values {
         if let Ok(header_value) = HeaderValue::from_str(value) {
@@ -1144,12 +1382,29 @@ fn image_mode_model_header(model: &GeminiModel, request_uuid: &str) -> Option<St
 }
 
 fn web_tool_nonce() -> String {
-    let mut nonce = String::from("!");
-    while nonce.len() < 2600 {
-        nonce.push_str(&Uuid::new_v4().simple().to_string());
+    if let Some(value) = configured_web_tool_nonce() {
+        return value;
     }
-    nonce.truncate(2600);
+    let mut nonce = String::from("!");
+    while nonce.len() < 2584 {
+        nonce.push_str(&general_purpose::URL_SAFE_NO_PAD.encode(Uuid::new_v4().as_bytes()));
+    }
+    nonce.truncate(2584);
     nonce
+}
+
+fn configured_web_tool_nonce() -> Option<String> {
+    std::env::var("GEMINI_WEB_TOOL_NONCE")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| s.len() > 1000)
+        .or_else(|| {
+            std::env::var("GEMINI_WEB_TOOL_NONCE_FILE")
+                .ok()
+                .and_then(|path| std::fs::read_to_string(path).ok())
+                .map(|s| s.trim().to_string())
+                .filter(|s| s.len() > 1000)
+        })
 }
 
 fn image_url_with_size(url: &str, generated: bool, size: &str) -> String {
@@ -1177,6 +1432,105 @@ fn dedupe_strings(values: Vec<String>) -> Vec<String> {
         }
     }
     out
+}
+
+async fn read_response_text_with_progress(
+    response: reqwest::Response,
+    progress: Option<mpsc::UnboundedSender<String>>,
+    client_id: &str,
+    model_name: &str,
+    request_started: Instant,
+) -> anyhow::Result<String> {
+    let body_started = Instant::now();
+    let Some(progress) = progress else {
+        let raw = response.text().await?;
+        tracing::info!(
+            client = client_id,
+            model = model_name,
+            body_ms = body_started.elapsed().as_millis(),
+            total_ms = request_started.elapsed().as_millis(),
+            response_bytes = raw.len(),
+            "Gemini generate response body read"
+        );
+        return Ok(raw);
+    };
+
+    let mut raw_bytes = Vec::new();
+    let mut emitted = String::new();
+    let mut upstream = response.bytes_stream();
+    while let Some(chunk) = upstream.next().await {
+        let chunk = chunk?;
+        raw_bytes.extend_from_slice(&chunk);
+        let raw = String::from_utf8_lossy(&raw_bytes);
+        if let Some(text) = extract_partial_text_from_response(&raw) {
+            send_stream_delta(&progress, &mut emitted, &text);
+        }
+    }
+    let raw = String::from_utf8_lossy(&raw_bytes).to_string();
+    tracing::info!(
+        client = client_id,
+        model = model_name,
+        body_ms = body_started.elapsed().as_millis(),
+        total_ms = request_started.elapsed().as_millis(),
+        response_bytes = raw.len(),
+        streamed_chars = emitted.chars().count(),
+        "Gemini generate response body streamed"
+    );
+    Ok(raw)
+}
+
+fn send_stream_delta(progress: &mpsc::UnboundedSender<String>, emitted: &mut String, text: &str) {
+    if text.trim().is_empty() || starts_like_tool_block(text) {
+        return;
+    }
+    if text.starts_with(emitted.as_str()) {
+        let delta = &text[emitted.len()..];
+        if !delta.is_empty() {
+            let _ = progress.send(delta.to_string());
+            *emitted = text.to_string();
+        }
+    } else if emitted.is_empty() {
+        let _ = progress.send(text.to_string());
+        *emitted = text.to_string();
+    }
+}
+
+fn starts_like_tool_block(text: &str) -> bool {
+    let compact: String = text
+        .trim_start()
+        .trim_start_matches('\\')
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .take(24)
+        .collect::<String>()
+        .to_ascii_lowercase();
+    !compact.is_empty()
+        && ("[toolcalls]".starts_with(&compact) || compact.starts_with("[toolcalls]"))
+}
+
+fn extract_partial_text_from_response(raw: &str) -> Option<String> {
+    let mut text = None;
+    for frame in parse_frames(raw) {
+        let Some(inner) = get_path(&frame, &[2]).and_then(Value::as_str) else {
+            continue;
+        };
+        let Ok(parsed_inner) = serde_json::from_str::<Value>(inner) else {
+            continue;
+        };
+        let Some(candidates) = get_path(&parsed_inner, &[4]).and_then(Value::as_array) else {
+            continue;
+        };
+        for candidate in candidates {
+            if let Some(candidate_text) = get_path(candidate, &[1, 0])
+                .or_else(|| get_path(candidate, &[22, 0]))
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+            {
+                text = Some(candidate_text.to_string());
+            }
+        }
+    }
+    text
 }
 
 fn extract_output_from_response(raw: &str) -> anyhow::Result<GeminiOutput> {
