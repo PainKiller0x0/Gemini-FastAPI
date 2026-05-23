@@ -762,19 +762,7 @@ async fn chat_completions(
                 tokio::select! {
                     output_text = &mut image_job => break output_text,
                     _ = heartbeat.tick() => {
-                        let keepalive = StreamChunk {
-                            id: id.clone(),
-                            object: "chat.completion.chunk",
-                            created,
-                            model: model_for_stream.clone(),
-                            choices: vec![StreamChoice {
-                                index: 0,
-                                delta: json!({"content": "\u{200b}"}),
-                                finish_reason: None,
-                            }],
-                            usage: None,
-                        };
-                        yield Ok(Event::default().data(serde_json::to_string(&keepalive).unwrap()));
+                        yield Ok(Event::default().comment("keepalive"));
                     }
                 }
             };
@@ -883,19 +871,7 @@ async fn chat_completions(
                     }
                     result = &mut generate_job => break result,
                     _ = heartbeat.tick() => {
-                        let keepalive = StreamChunk {
-                            id: id.clone(),
-                            object: "chat.completion.chunk",
-                            created,
-                            model: model_for_stream.clone(),
-                            choices: vec![StreamChoice {
-                                index: 0,
-                                delta: json!({"content": "\u{200b}"}),
-                                finish_reason: None,
-                            }],
-                            usage: None,
-                        };
-                        yield Ok(Event::default().data(serde_json::to_string(&keepalive).unwrap()));
+                        yield Ok(Event::default().comment("keepalive"));
                     }
                 }
             };
