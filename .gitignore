@@ -13,3 +13,10 @@ config.debug.yaml
 data/
 # Rust build artifacts
 target/
+# Nanobot runtime / deployment local state
+/runtime/
+/bin/
+*.bak
+*.bak.*
+*.tmp
+*.log

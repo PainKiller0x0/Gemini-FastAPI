@@ -1,0 +1,13 @@
+[Unit]
+Description=Gemini FastAPI active cookie/session probe
+After=network-online.target gemini-fastapi.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+Environment=GEMINI_FASTAPI_BASE_URL=http://127.0.0.1:8000
+Environment=GEMINI_FASTAPI_CONFIG=/opt/gemini-fastapi/runtime/config.yaml
+Environment=GEMINI_FASTAPI_PROBE_STATE=/opt/gemini-fastapi/runtime/active_probe.json
+Environment=GEMINI_FASTAPI_PROBE_MODEL=gemini-3.5-flash
+Environment=GEMINI_FASTAPI_PROBE_TIMEOUT=25
+ExecStart=/usr/bin/python3 /opt/gemini-fastapi/ops/gemini-active-probe.py

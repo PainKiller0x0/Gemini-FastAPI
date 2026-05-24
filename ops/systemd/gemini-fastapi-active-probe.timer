@@ -1,0 +1,12 @@
+[Unit]
+Description=Run Gemini FastAPI active probe periodically
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=10min
+AccuracySec=30s
+Persistent=true
+Unit=gemini-fastapi-active-probe.service
+
+[Install]
+WantedBy=timers.target
