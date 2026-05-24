@@ -18,4 +18,5 @@ install -m 0644 "$ROOT_DIR/ops/systemd/gemini-fastapi-active-probe.timer" /etc/s
 systemctl daemon-reload
 systemctl enable --now gemini-fastapi-active-probe.timer
 systemctl start gemini-fastapi-active-probe.service || true
-systemctl --no-pager status gemini-fastapi-active-probe.service gemini-fastapi-active-probe.timer
+systemctl --no-pager status gemini-fastapi-active-probe.timer
+systemctl --no-pager status gemini-fastapi-active-probe.service || true
