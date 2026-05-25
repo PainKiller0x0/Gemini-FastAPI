@@ -54,6 +54,7 @@ async fn main() -> anyhow::Result<()> {
 
     let config = Config::load()?;
     let append_builtin = config.gemini.model_strategy != "overwrite";
+    let session_refresh_secs = config.gemini.refresh_interval;
     let gemini = Arc::new(GeminiPool::new(
         config.gemini.clients.clone(),
         config.gemini.models.clone(),
@@ -69,6 +70,7 @@ async fn main() -> anyhow::Result<()> {
             "Gemini runtime model discovery failed; continuing with configured models"
         );
     }
+    spawn_session_warmup(gemini.clone(), session_refresh_secs);
     let history = HistoryStore::new(config.storage.path.clone());
     let state = Arc::new(AppState {
         config,
@@ -97,6 +99,25 @@ async fn main() -> anyhow::Result<()> {
     let listener = TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+fn spawn_session_warmup(gemini: Arc<GeminiPool>, refresh_interval_secs: u64) {
+    let period_secs = refresh_interval_secs.saturating_sub(60).max(60);
+    tokio::spawn(async move {
+        let period = std::time::Duration::from_secs(period_secs);
+        let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+        loop {
+            ticker.tick().await;
+            match gemini.refresh_sessions().await {
+                Ok(()) => tracing::info!(period_secs, "Gemini session proactive refresh completed"),
+                Err(error) => tracing::warn!(
+                    ?error,
+                    period_secs,
+                    "Gemini session proactive refresh failed"
+                ),
+            }
+        }
+    });
 }
 
 async fn health(State(state): State<Arc<AppState>>) -> Json<Value> {
