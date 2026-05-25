@@ -60,6 +60,7 @@ async fn main() -> anyhow::Result<()> {
         config.gemini.timeout,
         config.gemini.refresh_interval,
         append_builtin,
+        config.gemini.temporary_chat(),
     )?);
     let addr = config.server.addr()?;
     if let Err(error) = gemini.refresh_runtime_models().await {

@@ -118,6 +118,7 @@ pub struct GeminiClient {
     reqid: AtomicU64,
     session: Mutex<Option<SessionState>>,
     refresh_interval: Duration,
+    temporary_chat: bool,
 }
 
 pub struct GeminiPool {
@@ -132,6 +133,7 @@ impl GeminiPool {
         timeout_seconds: u64,
         refresh_interval_seconds: u64,
         append_builtin: bool,
+        temporary_chat: bool,
     ) -> anyhow::Result<Self> {
         if client_configs.is_empty() {
             return Err(anyhow!("at least one Gemini client is required"));
@@ -144,6 +146,7 @@ impl GeminiPool {
                 timeout_seconds,
                 refresh_interval_seconds,
                 append_builtin,
+                temporary_chat,
             )?));
         }
         Ok(Self {
@@ -310,6 +313,7 @@ impl GeminiClient {
         timeout_seconds: u64,
         refresh_interval_seconds: u64,
         append_builtin: bool,
+        temporary_chat: bool,
     ) -> anyhow::Result<Self> {
         let mut headers = HeaderMap::new();
         headers.insert(USER_AGENT, HeaderValue::from_static("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36"));
@@ -353,6 +357,7 @@ impl GeminiClient {
             reqid: AtomicU64::new(10_000),
             session: Mutex::new(None),
             refresh_interval: Duration::from_secs(refresh_interval_seconds),
+            temporary_chat,
         })
     }
 
@@ -509,35 +514,14 @@ impl GeminiClient {
         let uuid = Uuid::new_v4().to_string().to_uppercase();
         let language = request_language(&session.language, prompt, image_mode);
 
-        let mut inner = vec![Value::Null; if image_mode { 81 } else { 69 }];
-        inner[0] = json!([prompt, 0, null, file_data, null, null, 0]);
-        inner[1] = json!([language]);
-        inner[2] = json!(["", "", "", null, null, null, null, null, null, ""]);
-        inner[6] = json!([1]);
-        inner[7] = json!(1);
-        inner[10] = json!(1);
-        inner[11] = json!(0);
-        inner[17] = if image_mode {
-            json!([[0]])
-        } else {
-            json!([[0]])
-        };
-        inner[18] = json!(0);
-        inner[27] = json!(1);
-        inner[30] = json!([4]);
-        inner[41] = json!([1]);
-        if image_mode {
-            inner[3] = json!(web_tool_nonce());
-            inner[4] = json!(Uuid::new_v4().simple().to_string());
-            inner[49] = json!(14);
-            inner[67] = json!(0);
-            inner[79] = json!(1);
-            inner[80] = json!(2);
-        }
-        inner[53] = json!(0);
-        inner[59] = json!(uuid);
-        inner[61] = json!([]);
-        inner[68] = json!(2);
+        let inner = build_stream_generate_inner(
+            prompt,
+            language,
+            file_data,
+            &uuid,
+            image_mode,
+            self.temporary_chat,
+        );
 
         let mut request_headers = HeaderMap::new();
         request_headers.insert(
@@ -1289,6 +1273,45 @@ fn hex_value(value: u8) -> Option<u8> {
     }
 }
 
+fn build_stream_generate_inner(
+    prompt: &str,
+    language: &str,
+    file_data: Value,
+    uuid: &str,
+    image_mode: bool,
+    temporary_chat: bool,
+) -> Vec<Value> {
+    let mut inner = vec![Value::Null; if image_mode { 81 } else { 69 }];
+    inner[0] = json!([prompt, 0, null, file_data, null, null, 0]);
+    inner[1] = json!([language]);
+    inner[2] = json!(["", "", "", null, null, null, null, null, null, ""]);
+    inner[6] = json!([1]);
+    inner[7] = json!(1);
+    inner[10] = json!(1);
+    inner[11] = json!(0);
+    inner[17] = json!([[0]]);
+    inner[18] = json!(0);
+    inner[27] = json!(1);
+    inner[30] = json!([4]);
+    inner[41] = json!([1]);
+    if temporary_chat {
+        inner[45] = json!(1);
+    }
+    if image_mode {
+        inner[3] = json!(web_tool_nonce());
+        inner[4] = json!(Uuid::new_v4().simple().to_string());
+        inner[49] = json!(14);
+        inner[67] = json!(0);
+        inner[79] = json!(1);
+        inner[80] = json!(2);
+    }
+    inner[53] = json!(0);
+    inner[59] = json!(uuid);
+    inner[61] = json!([]);
+    inner[68] = json!(2);
+    inner
+}
+
 fn capture(regex: &Regex, text: &str) -> Option<String> {
     regex
         .captures(text)
@@ -1920,7 +1943,35 @@ fn ext_from_content_type(content_type: &str) -> Option<&'static str> {
 
 #[cfg(test)]
 mod tests {
-    use super::{contains_cjk, request_language};
+    use super::{build_stream_generate_inner, contains_cjk, request_language};
+    use serde_json::{Value, json};
+
+    #[test]
+    fn stream_generate_inner_keeps_normal_chat_saved_by_default() {
+        let inner = build_stream_generate_inner("hello", "en", Value::Null, "UUID", false, false);
+
+        assert_eq!(inner.len(), 69);
+        assert_eq!(inner[0], json!(["hello", 0, null, null, null, null, 0]));
+        assert_eq!(inner[45], Value::Null);
+    }
+
+    #[test]
+    fn stream_generate_inner_sets_temporary_chat_flag() {
+        let inner = build_stream_generate_inner("hello", "en", Value::Null, "UUID", false, true);
+
+        assert_eq!(inner.len(), 69);
+        assert_eq!(inner[45], json!(1));
+    }
+
+    #[test]
+    fn stream_generate_inner_sets_temporary_chat_flag_in_image_mode() {
+        let inner =
+            build_stream_generate_inner("draw a cat", "zh-CN", Value::Null, "UUID", true, true);
+
+        assert_eq!(inner.len(), 81);
+        assert_eq!(inner[17], json!([[0]]));
+        assert_eq!(inner[45], json!(1));
+    }
 
     #[test]
     fn detects_cjk_prompt_text() {

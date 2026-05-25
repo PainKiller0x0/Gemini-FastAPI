@@ -63,14 +63,26 @@ pub struct GeminiConfig {
     pub models: Vec<GeminiModelConfig>,
     #[serde(default = "default_model_strategy")]
     pub model_strategy: String,
+    #[serde(default = "default_chat_mode")]
+    pub chat_mode: String,
     #[serde(default = "default_timeout")]
     pub timeout: u64,
     #[serde(default = "default_refresh_interval")]
     pub refresh_interval: u64,
 }
 
+impl GeminiConfig {
+    pub fn temporary_chat(&self) -> bool {
+        self.chat_mode.eq_ignore_ascii_case("temporary")
+    }
+}
+
 fn default_model_strategy() -> String {
     "append".to_string()
+}
+
+fn default_chat_mode() -> String {
+    "normal".to_string()
 }
 
 fn default_timeout() -> u64 {
