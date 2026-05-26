@@ -729,6 +729,16 @@ fn image_token(filename: &str, api_key: Option<&str>) -> Option<String> {
     Some(digest[..24].to_string())
 }
 
+fn append_text_only_image_guard(image_generation_enabled: bool, prompt: &mut String) {
+    if image_generation_enabled {
+        return;
+    }
+    prompt.push_str("\n\n[system]\n");
+    prompt.push_str(
+        "This API bridge is text-only. Image creation/search/browsing tools are disabled. Never call or mention image creation availability, sign-in status, region availability, or image search. If the user talks about drawing, UI mockups, pictures, or images, answer as normal text. If the user explicitly asks you to create/generate/draw an image, say briefly that this endpoint only supports text and offer a text prompt, layout spec, or implementation plan instead."
+    );
+}
+
 fn should_use_image_tool(state: &AppState, model: &str, prompt: &str) -> bool {
     if !state.config.image_generation.is_enabled() {
         return false;
@@ -796,6 +806,10 @@ async fn chat_completions(
         input.prompt.push_str("\n\n[system]\n");
         input.prompt.push_str(&extra);
     }
+    append_text_only_image_guard(
+        state.config.image_generation.is_enabled(),
+        &mut input.prompt,
+    );
     let prompt = input.prompt;
     let model_name = request.model.clone();
     let completion_id = format!("chatcmpl-{}", Uuid::new_v4());
@@ -1335,6 +1349,10 @@ async fn create_response(
         input.prompt.push_str("\n\n[system]\n");
         input.prompt.push_str(&extra);
     }
+    append_text_only_image_guard(
+        state.config.image_generation.is_enabled(),
+        &mut input.prompt,
+    );
     let prompt = input.prompt;
     if prompt.trim().is_empty() {
         return Err(ApiError::bad_request("input is required"));
@@ -1567,10 +1585,25 @@ impl IntoResponse for ApiError {
 
 #[cfg(test)]
 mod tests {
-    use super::warm_generate_active_at;
+    use super::{append_text_only_image_guard, warm_generate_active_at};
 
     fn periods(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    #[test]
+    fn text_only_image_guard_blocks_gemini_image_tool_language() {
+        let mut prompt = "[user]\nplease draw a cat image".to_string();
+        append_text_only_image_guard(false, &mut prompt);
+        assert!(prompt.contains("text-only"));
+        assert!(prompt.contains("Never call or mention image creation availability"));
+    }
+
+    #[test]
+    fn text_only_image_guard_is_skipped_when_image_backend_enabled() {
+        let mut prompt = "[user]\nplease draw a cat image".to_string();
+        append_text_only_image_guard(true, &mut prompt);
+        assert!(!prompt.contains("text-only"));
     }
 
     #[test]
