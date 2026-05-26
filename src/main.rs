@@ -17,7 +17,7 @@ use axum::{
     routing::{get, post},
 };
 use base64::{Engine as _, engine::general_purpose};
-use chrono::Utc;
+use chrono::{Local, Timelike, Utc};
 use config::{Config, WarmGenerateConfig};
 use gemini::{
     GeminiImage, GeminiPool, extract_cookie_header_from_text, extract_web_tool_nonce_from_text,
@@ -129,6 +129,12 @@ fn spawn_generate_warmup(gemini: Arc<GeminiPool>, config: WarmGenerateConfig) {
 
     let interval_secs = config.interval.max(60);
     let initial_delay_secs = config.initial_delay.min(interval_secs);
+    tracing::info!(
+        model = config.model.as_str(),
+        interval_secs,
+        active_periods = ?config.active_periods,
+        "Gemini generate warmup enabled"
+    );
     tokio::spawn(async move {
         let period = std::time::Duration::from_secs(interval_secs);
         let first_tick =
@@ -136,6 +142,14 @@ fn spawn_generate_warmup(gemini: Arc<GeminiPool>, config: WarmGenerateConfig) {
         let mut ticker = tokio::time::interval_at(first_tick, period);
         loop {
             ticker.tick().await;
+            if !warm_generate_active_now(&config.active_periods) {
+                tracing::debug!(
+                    model = config.model.as_str(),
+                    active_periods = ?config.active_periods,
+                    "Gemini generate warmup skipped outside active period"
+                );
+                continue;
+            }
             let started = std::time::Instant::now();
             match gemini
                 .generate_output(&config.model, &config.prompt, &[])
@@ -157,6 +171,49 @@ fn spawn_generate_warmup(gemini: Arc<GeminiPool>, config: WarmGenerateConfig) {
             }
         }
     });
+}
+
+fn warm_generate_active_now(periods: &[String]) -> bool {
+    if periods.is_empty() {
+        return true;
+    }
+    let now = Local::now();
+    let minute_of_day = now.hour() * 60 + now.minute();
+    warm_generate_active_at(periods, minute_of_day)
+}
+
+fn warm_generate_active_at(periods: &[String], minute_of_day: u32) -> bool {
+    periods.iter().any(|period| {
+        parse_warm_period(period)
+            .map(|(start, end)| minute_in_period(minute_of_day, start, end))
+            .unwrap_or(false)
+    })
+}
+
+fn parse_warm_period(period: &str) -> Option<(u32, u32)> {
+    let (start, end) = period.split_once('-')?;
+    Some((parse_hhmm(start.trim())?, parse_hhmm(end.trim())?))
+}
+
+fn parse_hhmm(value: &str) -> Option<u32> {
+    let (hour, minute) = value.split_once(':')?;
+    let hour: u32 = hour.parse().ok()?;
+    let minute: u32 = minute.parse().ok()?;
+    if hour > 23 || minute > 59 {
+        return None;
+    }
+    Some(hour * 60 + minute)
+}
+
+fn minute_in_period(now: u32, start: u32, end: u32) -> bool {
+    if start == end {
+        return true;
+    }
+    if start < end {
+        now >= start && now < end
+    } else {
+        now >= start || now < end
+    }
 }
 
 async fn health(State(state): State<Arc<AppState>>) -> Json<Value> {
@@ -1505,5 +1562,36 @@ impl From<anyhow::Error> for ApiError {
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         (self.status, Json(json!({ "detail": self.detail }))).into_response()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::warm_generate_active_at;
+
+    fn periods(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    #[test]
+    fn warm_period_supports_same_day_window() {
+        let config = periods(&["09:00-18:00"]);
+        assert!(warm_generate_active_at(&config, 9 * 60));
+        assert!(warm_generate_active_at(&config, 17 * 60 + 59));
+        assert!(!warm_generate_active_at(&config, 18 * 60));
+    }
+
+    #[test]
+    fn warm_period_supports_midnight_crossing_window() {
+        let config = periods(&["07:00-01:30"]);
+        assert!(warm_generate_active_at(&config, 23 * 60));
+        assert!(warm_generate_active_at(&config, 60));
+        assert!(!warm_generate_active_at(&config, 2 * 60));
+    }
+
+    #[test]
+    fn warm_period_ignores_invalid_windows() {
+        let config = periods(&["bad", "25:00-26:00"]);
+        assert!(!warm_generate_active_at(&config, 12 * 60));
     }
 }

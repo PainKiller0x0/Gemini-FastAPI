@@ -1514,10 +1514,15 @@ async fn read_response_text_with_progress(
             if send_stream_delta(&progress, &mut emitted, &text) && first_text_delta_ms.is_none() {
                 let elapsed = request_started.elapsed().as_millis();
                 first_text_delta_ms = Some(elapsed);
+                let first_text_gap_ms = first_upstream_chunk_ms
+                    .map(|first_chunk| elapsed.saturating_sub(first_chunk))
+                    .unwrap_or(elapsed);
                 tracing::info!(
                     client = client_id,
                     model = model_name,
                     first_text_delta_ms = elapsed,
+                    first_upstream_chunk_ms = first_upstream_chunk_ms,
+                    first_text_gap_ms,
                     streamed_chars = emitted.chars().count(),
                     "Gemini generate first text delta"
                 );
@@ -1525,6 +1530,10 @@ async fn read_response_text_with_progress(
         }
     }
     let raw = String::from_utf8_lossy(&raw_bytes).to_string();
+    let first_text_gap_ms = match (first_upstream_chunk_ms, first_text_delta_ms) {
+        (Some(first_chunk), Some(first_text)) => Some(first_text.saturating_sub(first_chunk)),
+        _ => None,
+    };
     tracing::info!(
         client = client_id,
         model = model_name,
@@ -1532,6 +1541,7 @@ async fn read_response_text_with_progress(
         total_ms = request_started.elapsed().as_millis(),
         first_upstream_chunk_ms = first_upstream_chunk_ms,
         first_text_delta_ms = first_text_delta_ms,
+        first_text_gap_ms = first_text_gap_ms,
         response_bytes = raw.len(),
         streamed_chars = emitted.chars().count(),
         "Gemini generate response body streamed"
@@ -1544,7 +1554,7 @@ fn send_stream_delta(
     emitted: &mut String,
     text: &str,
 ) -> bool {
-    if text.trim().is_empty() || starts_like_tool_block(text) {
+    if is_effectively_empty_delta(text) || starts_like_tool_block(text) {
         return false;
     }
     if text.starts_with(emitted.as_str()) {
@@ -1560,6 +1570,17 @@ fn send_stream_delta(
         return true;
     }
     false
+}
+
+fn is_effectively_empty_delta(text: &str) -> bool {
+    text.trim_matches(|ch: char| {
+        ch.is_whitespace()
+            || matches!(
+                ch,
+                '\u{200b}' | '\u{200c}' | '\u{200d}' | '\u{2060}' | '\u{feff}'
+            )
+    })
+    .is_empty()
 }
 
 fn starts_like_tool_block(text: &str) -> bool {

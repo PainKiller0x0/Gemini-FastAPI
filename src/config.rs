@@ -107,6 +107,8 @@ pub struct WarmGenerateConfig {
     pub model: String,
     #[serde(default = "default_warm_generate_prompt")]
     pub prompt: String,
+    #[serde(default)]
+    pub active_periods: Vec<String>,
 }
 
 impl Default for WarmGenerateConfig {
@@ -117,6 +119,7 @@ impl Default for WarmGenerateConfig {
             initial_delay: default_warm_generate_initial_delay(),
             model: default_warm_generate_model(),
             prompt: default_warm_generate_prompt(),
+            active_periods: Vec::new(),
         }
     }
 }

@@ -31,7 +31,7 @@ This branch is the Rust rewrite track for Gemini-FastAPI. The goal is to remove 
   - API key is read from `image_generation.api_key` or the configured env var, default `GEMINI_API_KEY`
 - Lightweight JSONL request history at `storage.path/rust-history.jsonl`
 - Session/token refresh based on `gemini.refresh_interval`
-- Optional real-generation warmup via `gemini.warm_generate` to reduce cold Gemini Web tail latency
+- Optional real-generation warmup via `gemini.warm_generate` to reduce cold Gemini Web tail latency; set `active_periods` such as `["07:00-01:30"]` to avoid warming while asleep
 
 ## Notes
 
