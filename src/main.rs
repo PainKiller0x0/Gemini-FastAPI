@@ -18,7 +18,7 @@ use axum::{
 };
 use base64::{Engine as _, engine::general_purpose};
 use chrono::Utc;
-use config::Config;
+use config::{Config, WarmGenerateConfig};
 use gemini::{
     GeminiImage, GeminiPool, extract_cookie_header_from_text, extract_web_tool_nonce_from_text,
     short_fingerprint,
@@ -55,6 +55,7 @@ async fn main() -> anyhow::Result<()> {
     let config = Config::load()?;
     let append_builtin = config.gemini.model_strategy != "overwrite";
     let session_refresh_secs = config.gemini.refresh_interval;
+    let warm_generate = config.gemini.warm_generate.clone();
     let gemini = Arc::new(GeminiPool::new(
         config.gemini.clients.clone(),
         config.gemini.models.clone(),
@@ -71,6 +72,7 @@ async fn main() -> anyhow::Result<()> {
         );
     }
     spawn_session_warmup(gemini.clone(), session_refresh_secs);
+    spawn_generate_warmup(gemini.clone(), warm_generate);
     let history = HistoryStore::new(config.storage.path.clone());
     let state = Arc::new(AppState {
         config,
@@ -114,6 +116,43 @@ fn spawn_session_warmup(gemini: Arc<GeminiPool>, refresh_interval_secs: u64) {
                     ?error,
                     period_secs,
                     "Gemini session proactive refresh failed"
+                ),
+            }
+        }
+    });
+}
+
+fn spawn_generate_warmup(gemini: Arc<GeminiPool>, config: WarmGenerateConfig) {
+    if !config.enabled {
+        return;
+    }
+
+    let interval_secs = config.interval.max(60);
+    let initial_delay_secs = config.initial_delay.min(interval_secs);
+    tokio::spawn(async move {
+        let period = std::time::Duration::from_secs(interval_secs);
+        let first_tick =
+            tokio::time::Instant::now() + std::time::Duration::from_secs(initial_delay_secs);
+        let mut ticker = tokio::time::interval_at(first_tick, period);
+        loop {
+            ticker.tick().await;
+            let started = std::time::Instant::now();
+            match gemini
+                .generate_output(&config.model, &config.prompt, &[])
+                .await
+            {
+                Ok(output) => tracing::info!(
+                    model = config.model.as_str(),
+                    interval_secs,
+                    elapsed_ms = started.elapsed().as_millis(),
+                    output_chars = output.text.chars().count(),
+                    "Gemini generate warmup completed"
+                ),
+                Err(error) => tracing::warn!(
+                    ?error,
+                    model = config.model.as_str(),
+                    interval_secs,
+                    "Gemini generate warmup failed"
                 ),
             }
         }

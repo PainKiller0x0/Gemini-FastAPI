@@ -69,6 +69,8 @@ pub struct GeminiConfig {
     pub timeout: u64,
     #[serde(default = "default_refresh_interval")]
     pub refresh_interval: u64,
+    #[serde(default)]
+    pub warm_generate: WarmGenerateConfig,
 }
 
 impl GeminiConfig {
@@ -91,6 +93,48 @@ fn default_timeout() -> u64 {
 
 fn default_refresh_interval() -> u64 {
     600
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct WarmGenerateConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_warm_generate_interval")]
+    pub interval: u64,
+    #[serde(default = "default_warm_generate_initial_delay")]
+    pub initial_delay: u64,
+    #[serde(default = "default_warm_generate_model")]
+    pub model: String,
+    #[serde(default = "default_warm_generate_prompt")]
+    pub prompt: String,
+}
+
+impl Default for WarmGenerateConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            interval: default_warm_generate_interval(),
+            initial_delay: default_warm_generate_initial_delay(),
+            model: default_warm_generate_model(),
+            prompt: default_warm_generate_prompt(),
+        }
+    }
+}
+
+fn default_warm_generate_interval() -> u64 {
+    300
+}
+
+fn default_warm_generate_initial_delay() -> u64 {
+    20
+}
+
+fn default_warm_generate_model() -> String {
+    "gemini-3.5-flash".to_string()
+}
+
+fn default_warm_generate_prompt() -> String {
+    "只回复一个字：好".to_string()
 }
 
 #[derive(Debug, Clone, Deserialize)]
