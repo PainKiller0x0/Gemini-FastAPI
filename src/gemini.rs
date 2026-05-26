@@ -1494,6 +1494,10 @@ async fn read_response_text_with_progress(
     let mut raw_bytes = Vec::new();
     let mut emitted = String::new();
     let mut upstream = response.bytes_stream();
+    let mut parse_pos = 0usize;
+    let mut frames_seen = 0usize;
+    let mut first_complete_frame_ms: Option<u128> = None;
+    let mut first_complete_frame_kind: Option<&'static str> = None;
     let mut first_upstream_chunk_ms: Option<u128> = None;
     let mut first_text_delta_ms: Option<u128> = None;
     while let Some(chunk) = upstream.next().await {
@@ -1510,22 +1514,45 @@ async fn read_response_text_with_progress(
         }
         raw_bytes.extend_from_slice(&chunk);
         let raw = String::from_utf8_lossy(&raw_bytes);
-        if let Some(text) = extract_partial_text_from_response(&raw) {
-            if send_stream_delta(&progress, &mut emitted, &text) && first_text_delta_ms.is_none() {
+        for frame in parse_frames_from(&raw, &mut parse_pos) {
+            frames_seen += 1;
+            let frame_kind = classify_response_frame(&frame);
+            if first_complete_frame_ms.is_none() {
                 let elapsed = request_started.elapsed().as_millis();
-                first_text_delta_ms = Some(elapsed);
-                let first_text_gap_ms = first_upstream_chunk_ms
-                    .map(|first_chunk| elapsed.saturating_sub(first_chunk))
-                    .unwrap_or(elapsed);
+                first_complete_frame_ms = Some(elapsed);
+                first_complete_frame_kind = Some(frame_kind);
                 tracing::info!(
                     client = client_id,
                     model = model_name,
-                    first_text_delta_ms = elapsed,
-                    first_upstream_chunk_ms = first_upstream_chunk_ms,
-                    first_text_gap_ms,
-                    streamed_chars = emitted.chars().count(),
-                    "Gemini generate first text delta"
+                    first_complete_frame_ms = elapsed,
+                    frame_kind,
+                    "Gemini generate first complete frame"
                 );
+            }
+            if let Some(text) = extract_partial_text_from_frame(&frame) {
+                if send_stream_delta(&progress, &mut emitted, &text)
+                    && first_text_delta_ms.is_none()
+                {
+                    let elapsed = request_started.elapsed().as_millis();
+                    first_text_delta_ms = Some(elapsed);
+                    let first_text_gap_ms = first_upstream_chunk_ms
+                        .map(|first_chunk| elapsed.saturating_sub(first_chunk))
+                        .unwrap_or(elapsed);
+                    let first_frame_gap_ms = first_complete_frame_ms
+                        .map(|first_frame| elapsed.saturating_sub(first_frame));
+                    tracing::info!(
+                        client = client_id,
+                        model = model_name,
+                        first_text_delta_ms = elapsed,
+                        first_upstream_chunk_ms = first_upstream_chunk_ms,
+                        first_complete_frame_ms = first_complete_frame_ms,
+                        first_text_gap_ms,
+                        first_frame_gap_ms = first_frame_gap_ms,
+                        frames_before_text = frames_seen,
+                        streamed_chars = emitted.chars().count(),
+                        "Gemini generate first text delta"
+                    );
+                }
             }
         }
     }
@@ -1540,8 +1567,11 @@ async fn read_response_text_with_progress(
         body_ms = body_started.elapsed().as_millis(),
         total_ms = request_started.elapsed().as_millis(),
         first_upstream_chunk_ms = first_upstream_chunk_ms,
+        first_complete_frame_ms = first_complete_frame_ms,
+        first_complete_frame_kind = first_complete_frame_kind.unwrap_or("none"),
         first_text_delta_ms = first_text_delta_ms,
         first_text_gap_ms = first_text_gap_ms,
+        frames_seen,
         response_bytes = raw.len(),
         streamed_chars = emitted.chars().count(),
         "Gemini generate response body streamed"
@@ -1596,29 +1626,39 @@ fn starts_like_tool_block(text: &str) -> bool {
         && ("[toolcalls]".starts_with(&compact) || compact.starts_with("[toolcalls]"))
 }
 
-fn extract_partial_text_from_response(raw: &str) -> Option<String> {
-    let mut text = None;
-    for frame in parse_frames(raw) {
-        let Some(inner) = get_path(&frame, &[2]).and_then(Value::as_str) else {
-            continue;
-        };
-        let Ok(parsed_inner) = serde_json::from_str::<Value>(inner) else {
-            continue;
-        };
-        let Some(candidates) = get_path(&parsed_inner, &[4]).and_then(Value::as_array) else {
-            continue;
-        };
-        for candidate in candidates {
-            if let Some(candidate_text) = get_path(candidate, &[1, 0])
-                .or_else(|| get_path(candidate, &[22, 0]))
-                .and_then(Value::as_str)
-                .filter(|value| !value.trim().is_empty())
-            {
-                text = Some(candidate_text.to_string());
-            }
-        }
+fn extract_partial_text_from_frame(frame: &Value) -> Option<String> {
+    let inner = get_path(frame, &[2]).and_then(Value::as_str)?;
+    let parsed_inner = serde_json::from_str::<Value>(inner).ok()?;
+    let candidates = get_path(&parsed_inner, &[4]).and_then(Value::as_array)?;
+    candidates.iter().filter_map(candidate_text).last()
+}
+
+fn candidate_text(candidate: &Value) -> Option<String> {
+    get_path(candidate, &[1, 0])
+        .or_else(|| get_path(candidate, &[22, 0]))
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(ToString::to_string)
+}
+
+fn classify_response_frame(frame: &Value) -> &'static str {
+    let Some(inner) = get_path(frame, &[2]).and_then(Value::as_str) else {
+        return "no_inner";
+    };
+    let Ok(parsed_inner) = serde_json::from_str::<Value>(inner) else {
+        return "invalid_inner";
+    };
+    let Some(candidates) = get_path(&parsed_inner, &[4]).and_then(Value::as_array) else {
+        return "no_candidates";
+    };
+    if candidates
+        .iter()
+        .any(|candidate| candidate_text(candidate).is_some())
+    {
+        "text"
+    } else {
+        "candidate_no_text"
     }
-    text
 }
 
 fn extract_output_from_response(raw: &str) -> anyhow::Result<GeminiOutput> {
@@ -1728,41 +1768,68 @@ fn generated_image_values(candidate: &Value) -> Vec<&Value> {
 }
 
 fn parse_frames(raw: &str) -> Vec<Value> {
-    let mut content = raw.to_string();
-    if content.starts_with(")]}'") {
-        content = content[4..].trim_start().to_string();
-    }
-    let chars: Vec<char> = content.chars().collect();
     let mut pos = 0usize;
+    parse_frames_from(raw, &mut pos)
+}
+
+fn parse_frames_from(raw: &str, pos: &mut usize) -> Vec<Value> {
+    let mut cursor = (*pos).min(raw.len());
+    if cursor == 0 && raw.starts_with(")]}'") {
+        cursor = 4;
+    }
     let mut frames = Vec::new();
 
-    while pos < chars.len() {
-        while pos < chars.len() && chars[pos].is_whitespace() {
-            pos += 1;
+    loop {
+        while cursor < raw.len() {
+            let Some(ch) = raw[cursor..].chars().next() else {
+                break;
+            };
+            if !ch.is_whitespace() {
+                break;
+            }
+            cursor += ch.len_utf8();
+            *pos = cursor;
         }
-        let digit_start = pos;
-        while pos < chars.len() && chars[pos].is_ascii_digit() {
-            pos += 1;
-        }
-        if digit_start == pos {
+        if cursor >= raw.len() {
             break;
         }
-        let length: usize = chars[digit_start..pos]
-            .iter()
-            .collect::<String>()
-            .parse()
-            .unwrap_or(0);
-        let start = pos;
+
+        let frame_start = cursor;
+        let digit_start = cursor;
+        while cursor < raw.len() {
+            let Some(ch) = raw[cursor..].chars().next() else {
+                break;
+            };
+            if !ch.is_ascii_digit() {
+                break;
+            }
+            cursor += ch.len_utf8();
+        }
+        if digit_start == cursor {
+            cursor = frame_start;
+            break;
+        }
+
+        let Ok(length) = raw[digit_start..cursor].parse::<usize>() else {
+            cursor = frame_start;
+            break;
+        };
+        let payload_start = cursor;
         let mut units = 0usize;
-        while pos < chars.len() && units < length {
-            units += chars[pos].len_utf16();
-            pos += 1;
+        while cursor < raw.len() && units < length {
+            let Some(ch) = raw[cursor..].chars().next() else {
+                break;
+            };
+            units += ch.len_utf16();
+            cursor += ch.len_utf8();
         }
         if units < length {
+            cursor = frame_start;
             break;
         }
-        let chunk = chars[start..pos].iter().collect::<String>();
-        let chunk = chunk.trim();
+
+        let chunk = raw[payload_start..cursor].trim();
+        *pos = cursor;
         if chunk.is_empty() {
             continue;
         }
@@ -1774,6 +1841,7 @@ fn parse_frames(raw: &str) -> Vec<Value> {
             }
         }
     }
+    *pos = (*pos).max(cursor);
     frames
 }
 
@@ -1964,8 +2032,61 @@ fn ext_from_content_type(content_type: &str) -> Option<&'static str> {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_stream_generate_inner, contains_cjk, request_language};
+    use super::{
+        build_stream_generate_inner, contains_cjk, extract_partial_text_from_frame,
+        parse_frames_from, request_language,
+    };
     use serde_json::{Value, json};
+
+    fn encoded_frame(frame: Value) -> String {
+        let payload = json!([frame]).to_string();
+        format!("{}{}", payload.encode_utf16().count(), payload)
+    }
+
+    #[test]
+    fn incremental_frame_parser_waits_for_complete_frame() {
+        let inner = json!([null, ["cid", "rid"], null, null, [["rcid", ["??"]]]]).to_string();
+        let raw = encoded_frame(json!([null, null, inner]));
+        let split_at = raw.len() - 3;
+        let mut pos = 0usize;
+
+        assert!(parse_frames_from(&raw[..split_at], &mut pos).is_empty());
+        assert_eq!(pos, 0);
+
+        let frames = parse_frames_from(&raw, &mut pos);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(
+            extract_partial_text_from_frame(&frames[0]).as_deref(),
+            Some("??")
+        );
+        assert_eq!(pos, raw.len());
+    }
+
+    #[test]
+    fn incremental_frame_parser_only_returns_new_frames() {
+        let first_inner = json!([null, ["cid", "rid"], null, null, [["rcid", ["?"]]]]).to_string();
+        let second_inner =
+            json!([null, ["cid", "rid"], null, null, [["rcid", ["??"]]]]).to_string();
+        let raw = format!(
+            "{}{}",
+            encoded_frame(json!([null, null, first_inner])),
+            encoded_frame(json!([null, null, second_inner]))
+        );
+        let mut pos = 0usize;
+
+        let frames = parse_frames_from(&raw, &mut pos);
+        assert_eq!(frames.len(), 2);
+        assert_eq!(
+            extract_partial_text_from_frame(&frames[0]).as_deref(),
+            Some("?")
+        );
+        assert_eq!(
+            extract_partial_text_from_frame(&frames[1]).as_deref(),
+            Some("??")
+        );
+
+        assert!(parse_frames_from(&raw, &mut pos).is_empty());
+    }
 
     #[test]
     fn stream_generate_inner_keeps_normal_chat_saved_by_default() {
