@@ -729,8 +729,12 @@ fn image_token(filename: &str, api_key: Option<&str>) -> Option<String> {
     Some(digest[..24].to_string())
 }
 
-fn append_text_only_image_guard(image_generation_enabled: bool, prompt: &mut String) {
-    if image_generation_enabled {
+fn append_text_only_image_guard(
+    image_generation_enabled: bool,
+    has_input_attachments: bool,
+    prompt: &mut String,
+) {
+    if image_generation_enabled || has_input_attachments {
         return;
     }
     prompt.push_str("\n\n[system]\n");
@@ -808,6 +812,7 @@ async fn chat_completions(
     }
     append_text_only_image_guard(
         state.config.image_generation.is_enabled(),
+        !input.attachments.is_empty(),
         &mut input.prompt,
     );
     let prompt = input.prompt;
@@ -1351,6 +1356,7 @@ async fn create_response(
     }
     append_text_only_image_guard(
         state.config.image_generation.is_enabled(),
+        !input.attachments.is_empty(),
         &mut input.prompt,
     );
     let prompt = input.prompt;
@@ -1594,7 +1600,7 @@ mod tests {
     #[test]
     fn text_only_image_guard_blocks_gemini_image_tool_language() {
         let mut prompt = "[user]\nplease draw a cat image".to_string();
-        append_text_only_image_guard(false, &mut prompt);
+        append_text_only_image_guard(false, false, &mut prompt);
         assert!(prompt.contains("text-only"));
         assert!(prompt.contains("Never call or mention image creation availability"));
     }
@@ -1602,7 +1608,14 @@ mod tests {
     #[test]
     fn text_only_image_guard_is_skipped_when_image_backend_enabled() {
         let mut prompt = "[user]\nplease draw a cat image".to_string();
-        append_text_only_image_guard(true, &mut prompt);
+        append_text_only_image_guard(true, false, &mut prompt);
+        assert!(!prompt.contains("text-only"));
+    }
+
+    #[test]
+    fn text_only_image_guard_is_skipped_for_input_attachments() {
+        let mut prompt = "[user]\nplease describe this attached image".to_string();
+        append_text_only_image_guard(false, true, &mut prompt);
         assert!(!prompt.contains("text-only"));
     }
 

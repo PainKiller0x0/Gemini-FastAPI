@@ -322,7 +322,7 @@ fn content_to_text(value: Option<&Value>) -> Option<String> {
         Value::String(text) => Some(text.clone()),
         Value::Array(items) => {
             let mut parts = Vec::new();
-            for item in items {
+            for (index, item) in items.iter().enumerate() {
                 match item.get("type").and_then(Value::as_str) {
                     Some("text") | Some("input_text") | Some("output_text") => {
                         if let Some(text) = item.get("text").and_then(Value::as_str) {
@@ -330,18 +330,24 @@ fn content_to_text(value: Option<&Value>) -> Option<String> {
                         }
                     }
                     Some("image_url") => {
-                        let url = item
+                        let has_image = item
                             .get("image_url")
                             .and_then(|v| v.get("url").or(Some(v)))
                             .and_then(Value::as_str)
-                            .unwrap_or("");
-                        if !url.is_empty() {
-                            parts.push(format!("[Image URL: {url}]"));
+                            .map(|s| !s.trim().is_empty())
+                            .unwrap_or(false);
+                        if has_image {
+                            parts.push(format!("[Image attachment: input_image_{}]", index + 1));
                         }
                     }
                     Some("input_image") => {
-                        if let Some(url) = item.get("image_url").and_then(Value::as_str) {
-                            parts.push(format!("[Image URL: {url}]"));
+                        let has_image = item
+                            .get("image_url")
+                            .and_then(Value::as_str)
+                            .map(|s| !s.trim().is_empty())
+                            .unwrap_or(false);
+                        if has_image {
+                            parts.push(format!("[Image attachment: input_image_{}]", index + 1));
                         }
                     }
                     Some("file") | Some("input_file") => {
@@ -797,4 +803,33 @@ fn response_item_to_message(item: &Value) -> Vec<ChatMessage> {
         tool_call_id: None,
         reasoning_content: None,
     }]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ChatMessage, messages_to_gemini_input};
+    use serde_json::json;
+
+    #[test]
+    fn image_data_url_becomes_attachment_without_prompt_base64() {
+        let message = ChatMessage {
+            role: "user".to_string(),
+            content: Some(json!([
+                {"type":"text", "text":"describe this image"},
+                {"type":"image_url", "image_url":{"url":"data:image/png;base64,aGVsbG8="}}
+            ])),
+            name: None,
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        };
+
+        let input = messages_to_gemini_input(&[message]);
+
+        assert_eq!(input.attachments.len(), 1);
+        assert!(input.prompt.contains("describe this image"));
+        assert!(input.prompt.contains("[Image attachment: input_image_2]"));
+        assert!(!input.prompt.contains("data:image"));
+        assert!(!input.prompt.contains("aGVsbG8="));
+    }
 }
