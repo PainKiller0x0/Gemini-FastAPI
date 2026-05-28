@@ -204,6 +204,14 @@ pub struct ImageGenerationConfig {
     pub imagen_api_base_url: String,
     #[serde(default)]
     pub public_base_url: Option<String>,
+    #[serde(default)]
+    pub worker_url: Option<String>,
+    #[serde(default)]
+    pub worker_token: Option<String>,
+    #[serde(default)]
+    pub worker_token_file: Option<String>,
+    #[serde(default = "default_worker_timeout_ms")]
+    pub worker_timeout_ms: u64,
 }
 
 impl Default for ImageGenerationConfig {
@@ -217,6 +225,10 @@ impl Default for ImageGenerationConfig {
             gemini_api_base_url: default_gemini_api_base_url(),
             imagen_api_base_url: default_imagen_api_base_url(),
             public_base_url: None,
+            worker_url: None,
+            worker_token: None,
+            worker_token_file: None,
+            worker_timeout_ms: default_worker_timeout_ms(),
         }
     }
 }
@@ -235,6 +247,28 @@ impl ImageGenerationConfig {
 
     pub fn is_enabled(&self) -> bool {
         !matches!(self.backend.as_str(), "" | "disabled" | "none")
+    }
+
+    pub fn worker_endpoint(&self) -> Option<String> {
+        self.worker_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|url| !url.is_empty())
+            .map(|url| url.trim_end_matches('/').to_string())
+    }
+
+    pub fn resolved_worker_token(&self) -> Option<String> {
+        self.worker_token
+            .clone()
+            .filter(|token| !token.trim().is_empty())
+            .or_else(|| {
+                self.worker_token_file.as_ref().and_then(|path| {
+                    fs::read_to_string(path)
+                        .ok()
+                        .map(|token| token.trim().to_string())
+                        .filter(|token| !token.is_empty())
+                })
+            })
     }
 }
 
@@ -260,4 +294,8 @@ fn default_gemini_api_base_url() -> String {
 
 fn default_imagen_api_base_url() -> String {
     "https://generativelanguage.googleapis.com".to_string()
+}
+
+fn default_worker_timeout_ms() -> u64 {
+    180_000
 }

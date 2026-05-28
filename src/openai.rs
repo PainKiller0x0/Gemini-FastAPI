@@ -295,10 +295,53 @@ pub fn messages_to_gemini_input(messages: &[ChatMessage]) -> GeminiInput {
     for message in messages {
         collect_attachments(message.content.as_ref(), &mut attachments);
     }
+    let prompt = if attachments.is_empty() {
+        messages_to_prompt(messages)
+    } else {
+        messages_to_plain_prompt(messages)
+    };
     GeminiInput {
-        prompt: messages_to_prompt(messages),
+        prompt,
         attachments,
     }
+}
+
+pub fn latest_user_plain_text(messages: &[ChatMessage]) -> String {
+    messages
+        .iter()
+        .rev()
+        .find(|message| normalize_role(&message.role) == "user")
+        .and_then(|message| content_to_plain_text(message.content.as_ref()))
+        .unwrap_or_default()
+}
+
+fn messages_to_plain_prompt(messages: &[ChatMessage]) -> String {
+    let mut system_parts = Vec::new();
+    let mut user_parts = Vec::new();
+    for message in messages {
+        let Some(text) = content_to_plain_text(message.content.as_ref()) else {
+            continue;
+        };
+        let text = text.trim();
+        if text.is_empty() {
+            continue;
+        }
+        match normalize_role(&message.role) {
+            "system" => system_parts.push(text.to_string()),
+            "user" => user_parts.push(text.to_string()),
+            "assistant" => user_parts.push(format!("Assistant: {text}")),
+            "tool" => user_parts.push(format!("Tool: {text}")),
+            _ => user_parts.push(text.to_string()),
+        }
+    }
+    let mut parts = Vec::new();
+    if !system_parts.is_empty() {
+        parts.push(system_parts.join("\n\n"));
+    }
+    if !user_parts.is_empty() {
+        parts.push(user_parts.join("\n\n"));
+    }
+    parts.join("\n\n")
 }
 
 fn add_tag(role: &str, content: &str, unclosed: bool) -> String {
@@ -313,6 +356,42 @@ fn normalize_role(role: &str) -> &str {
     match role {
         "developer" => "system",
         other => other,
+    }
+}
+
+fn content_to_plain_text(value: Option<&Value>) -> Option<String> {
+    match value? {
+        Value::Null => None,
+        Value::String(text) => Some(text.clone()),
+        Value::Array(items) => {
+            let mut parts = Vec::new();
+            for item in items {
+                match item.get("type").and_then(Value::as_str) {
+                    Some("text") | Some("input_text") | Some("output_text") => {
+                        if let Some(text) = item.get("text").and_then(Value::as_str) {
+                            parts.push(text.to_string());
+                        }
+                    }
+                    Some("image_url") | Some("input_image") => {}
+                    Some("file") | Some("input_file") => {
+                        let filename = item
+                            .get("file")
+                            .and_then(|f| f.get("filename"))
+                            .or_else(|| item.get("filename"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("attachment");
+                        parts.push(format!("[File attachment: {filename}]"));
+                    }
+                    _ => {
+                        if let Some(text) = item.get("text").and_then(Value::as_str) {
+                            parts.push(text.to_string());
+                        }
+                    }
+                }
+            }
+            Some(parts.join("\n"))
+        }
+        other => Some(other.to_string()),
     }
 }
 
@@ -807,7 +886,7 @@ fn response_item_to_message(item: &Value) -> Vec<ChatMessage> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ChatMessage, messages_to_gemini_input};
+    use super::{ChatMessage, latest_user_plain_text, messages_to_gemini_input};
     use serde_json::json;
 
     #[test]
@@ -828,8 +907,35 @@ mod tests {
 
         assert_eq!(input.attachments.len(), 1);
         assert!(input.prompt.contains("describe this image"));
-        assert!(input.prompt.contains("[Image attachment: input_image_2]"));
+        assert!(!input.prompt.contains("[Image attachment:"));
         assert!(!input.prompt.contains("data:image"));
         assert!(!input.prompt.contains("aGVsbG8="));
+    }
+
+    #[test]
+    fn latest_user_plain_text_ignores_system_image_generation_words() {
+        let messages = vec![
+            ChatMessage {
+                role: "system".to_string(),
+                content: Some(json!("you can create images when asked")),
+                name: None,
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+            },
+            ChatMessage {
+                role: "user".to_string(),
+                content: Some(json!([
+                    {"type":"text", "text":"what is in this image?"},
+                    {"type":"image_url", "image_url":{"url":"data:image/png;base64,aGVsbG8="}}
+                ])),
+                name: None,
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+            },
+        ];
+
+        assert_eq!(latest_user_plain_text(&messages), "what is in this image?");
     }
 }

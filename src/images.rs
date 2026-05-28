@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use anyhow::{Context, anyhow};
 use base64::{Engine as _, engine::general_purpose};
 use reqwest::Client;
@@ -62,19 +64,90 @@ pub async fn generate_images(
             "image generation is disabled; configure image_generation.backend"
         ));
     }
-    let api_key = config
-        .resolved_api_key()
-        .context("image generation api key is not configured")?;
     let model = choose_model(config, request);
     match config.backend.as_str() {
+        "gemini_worker" | "worker" | "gemini_web_worker" => {
+            generate_with_worker(http, config, request).await
+        }
         "gemini_api" | "gemini" | "nano_banana" => {
+            let api_key = config
+                .resolved_api_key()
+                .context("image generation api key is not configured")?;
             generate_with_gemini(http, config, request, &api_key, &model).await
         }
         "imagen_api" | "imagen" => {
+            let api_key = config
+                .resolved_api_key()
+                .context("image generation api key is not configured")?;
             generate_with_imagen(http, config, request, &api_key, &model).await
         }
         other => Err(anyhow!("unsupported image generation backend: {other}")),
     }
+}
+
+async fn generate_with_worker(
+    http: &Client,
+    config: &ImageGenerationConfig,
+    request: &ImageGenerationRequest,
+) -> anyhow::Result<Vec<GeneratedImage>> {
+    let worker_url = config
+        .worker_endpoint()
+        .context("image worker_url is not configured")?;
+    let token = config
+        .resolved_worker_token()
+        .context("image worker token is not configured")?;
+    let count = image_count(request.n);
+    let body = json!({
+        "prompt": request.prompt,
+        "timeout_ms": config.worker_timeout_ms,
+        "max_images": count,
+    });
+    let response = http
+        .post(format!("{worker_url}/image"))
+        .bearer_auth(token)
+        .timeout(Duration::from_millis(
+            config.worker_timeout_ms.saturating_add(30_000),
+        ))
+        .json(&body)
+        .send()
+        .await?;
+    let status = response.status();
+    let value: Value = response.json().await.unwrap_or_else(|_| json!({}));
+    if !status.is_success() || value.get("ok").and_then(Value::as_bool) == Some(false) {
+        return Err(anyhow!(
+            "Gemini worker image generation failed with status {status}: {}",
+            value
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown error")
+        ));
+    }
+    let images = value
+        .get("images")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|image| {
+            let data = image
+                .get("data_base64")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())?;
+            let mime_type = image
+                .get("mime")
+                .or_else(|| image.get("mime_type"))
+                .and_then(Value::as_str)
+                .unwrap_or("image/png");
+            Some(GeneratedImage {
+                b64_json: data.to_string(),
+                mime_type: mime_type.to_string(),
+                revised_prompt: Some(request.prompt.clone()),
+            })
+        })
+        .collect::<Vec<_>>();
+    if images.is_empty() {
+        return Err(anyhow!("Gemini worker returned no generated images"));
+    }
+    Ok(images)
 }
 
 fn choose_model(config: &ImageGenerationConfig, request: &ImageGenerationRequest) -> String {

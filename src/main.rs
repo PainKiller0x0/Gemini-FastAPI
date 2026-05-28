@@ -20,16 +20,17 @@ use base64::{Engine as _, engine::general_purpose};
 use chrono::{Local, Timelike, Utc};
 use config::{Config, WarmGenerateConfig};
 use gemini::{
-    GeminiImage, GeminiPool, extract_cookie_header_from_text, extract_web_tool_nonce_from_text,
-    short_fingerprint,
+    GeminiImage, GeminiOutput, GeminiPool, extract_cookie_header_from_text,
+    extract_web_tool_nonce_from_text, short_fingerprint,
 };
 use history::{HistoryRecord, HistoryStore, started, timestamp};
 use images::{ImageData, ImageGenerationRequest, ImageGenerationResponse};
 use openai::{
-    AssistantMessage, ChatCompletionRequest, ChatCompletionResponse, Choice, ModelData,
-    ModelListResponse, ResponseCreateRequest, StreamChoice, StreamChunk, Usage,
-    chat_extra_instructions, estimate_tokens, messages_to_gemini_input, process_output,
-    response_extra_instructions, response_input_to_gemini_input,
+    AssistantMessage, AttachmentSource, ChatCompletionRequest, ChatCompletionResponse, Choice,
+    InputAttachment, ModelData, ModelListResponse, ResponseCreateRequest, StreamChoice,
+    StreamChunk, Usage, chat_extra_instructions, estimate_tokens, latest_user_plain_text,
+    messages_to_gemini_input, process_output, response_extra_instructions,
+    response_input_to_gemini_input,
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -445,15 +446,7 @@ async fn append_image_markdown(
     if saved.is_empty() {
         return Ok(text);
     }
-    let base_url = state
-        .config
-        .image_generation
-        .public_base_url
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(|s| s.trim_end_matches('/').to_string())
-        .or_else(|| request_base_url(headers));
+    let base_url = image_base_url_for_chat(state, headers);
     let cleaned_text = strip_generated_image_placeholders(&text);
     let mut out = if cleaned_text.trim().is_empty() {
         "Image generated.".to_string()
@@ -461,20 +454,64 @@ async fn append_image_markdown(
         cleaned_text
     };
     for image in saved {
-        let token = image_token(&image.filename, state.config.server.api_key.as_deref())
-            .map(|token| format!("?token={token}"))
-            .unwrap_or_default();
-        let path = format!("/images/{}{}", image.filename, token);
-        let url = base_url
-            .as_ref()
-            .map(|base| format!("{base}{path}"))
-            .unwrap_or(path);
-        out.push_str(&format!(
-            "\n\n![{}]({})\n\n[打开图片]({})",
-            image.filename, url, url
-        ));
+        append_image_link(&mut out, state, base_url.as_deref(), &image.filename);
     }
     Ok(out)
+}
+
+async fn append_generated_image_markdown(
+    state: &AppState,
+    headers: &HeaderMap,
+    text: String,
+    images: &[images::GeneratedImage],
+) -> Result<String, ApiError> {
+    if images.is_empty() {
+        return Ok(text);
+    }
+    let saved = persist_generated_images(state, images).await?;
+    if saved.is_empty() {
+        return Ok(text);
+    }
+    let base_url = image_base_url_for_chat(state, headers);
+    let mut out = if text.trim().is_empty() {
+        "Image generated.".to_string()
+    } else {
+        text
+    };
+    for image in saved {
+        append_image_link(&mut out, state, base_url.as_deref(), &image.filename);
+    }
+    Ok(out)
+}
+
+fn configured_image_base_url(state: &AppState) -> Option<String> {
+    state
+        .config
+        .image_generation
+        .public_base_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.trim_end_matches('/').to_string())
+}
+
+fn image_base_url_for_chat(state: &AppState, headers: &HeaderMap) -> Option<String> {
+    configured_image_base_url(state).or_else(|| request_base_url(headers))
+}
+
+fn append_image_link(out: &mut String, state: &AppState, base_url: Option<&str>, filename: &str) {
+    let token = image_token(filename, state.config.server.api_key.as_deref())
+        .map(|token| format!("?token={token}"))
+        .unwrap_or_default();
+    let path = format!("/images/{filename}{token}");
+    let url = base_url.map(|base| format!("{base}{path}")).unwrap_or(path);
+    out.push_str(&format!(
+        "
+
+![{filename}]({url})
+
+[Open image]({url})"
+    ));
 }
 
 fn strip_generated_image_placeholders(text: &str) -> String {
@@ -518,22 +555,154 @@ fn request_base_url(headers: &HeaderMap) -> Option<String> {
     Some(format!("{proto}://{host}"))
 }
 
-async fn save_generated_images(
+fn vision_worker_enabled(state: &AppState) -> bool {
+    state.config.image_generation.worker_endpoint().is_some()
+        && state
+            .config
+            .image_generation
+            .resolved_worker_token()
+            .is_some()
+}
+
+fn guess_attachment_content_type(filename: &str, explicit: Option<&str>) -> String {
+    if let Some(value) = explicit.map(str::trim).filter(|value| !value.is_empty()) {
+        return value.to_string();
+    }
+    let lower = filename.to_ascii_lowercase();
+    if lower.ends_with(".jpg") || lower.ends_with(".jpeg") {
+        "image/jpeg".to_string()
+    } else if lower.ends_with(".webp") {
+        "image/webp".to_string()
+    } else if lower.ends_with(".gif") {
+        "image/gif".to_string()
+    } else {
+        "image/png".to_string()
+    }
+}
+
+async fn worker_image_payload(
+    state: &AppState,
+    attachment: &InputAttachment,
+) -> anyhow::Result<Value> {
+    let (data, content_type) = match &attachment.source {
+        AttachmentSource::Data(data) => (
+            data.clone(),
+            guess_attachment_content_type(&attachment.filename, attachment.content_type.as_deref()),
+        ),
+        AttachmentSource::Url(url) => {
+            let response = state
+                .http
+                .get(url)
+                .timeout(std::time::Duration::from_millis(
+                    state.config.image_generation.worker_timeout_ms.min(60_000),
+                ))
+                .send()
+                .await?
+                .error_for_status()?;
+            let content_type = response
+                .headers()
+                .get("content-type")
+                .and_then(|value| value.to_str().ok())
+                .map(ToString::to_string)
+                .unwrap_or_else(|| {
+                    guess_attachment_content_type(
+                        &attachment.filename,
+                        attachment.content_type.as_deref(),
+                    )
+                });
+            (response.bytes().await?.to_vec(), content_type)
+        }
+    };
+    Ok(json!({
+        "filename": attachment.filename,
+        "mime": content_type,
+        "data_base64": general_purpose::STANDARD.encode(data),
+    }))
+}
+
+async fn generate_vision_worker_output(
+    state: &AppState,
+    prompt: &str,
+    attachments: &[InputAttachment],
+) -> anyhow::Result<GeminiOutput> {
+    let worker_url = state
+        .config
+        .image_generation
+        .worker_endpoint()
+        .ok_or_else(|| anyhow::anyhow!("Gemini vision worker_url is not configured"))?;
+    let token = state
+        .config
+        .image_generation
+        .resolved_worker_token()
+        .ok_or_else(|| anyhow::anyhow!("Gemini vision worker token is not configured"))?;
+    let mut images = Vec::new();
+    for attachment in attachments {
+        images.push(worker_image_payload(state, attachment).await?);
+    }
+    if images.is_empty() {
+        return Err(anyhow::anyhow!(
+            "Gemini vision worker requires at least one image"
+        ));
+    }
+    let body = json!({
+        "prompt": prompt,
+        "images": images,
+        "timeout_ms": state.config.image_generation.worker_timeout_ms,
+    });
+    let response = state
+        .http
+        .post(format!("{worker_url}/vision"))
+        .bearer_auth(token)
+        .timeout(std::time::Duration::from_millis(
+            state
+                .config
+                .image_generation
+                .worker_timeout_ms
+                .saturating_add(30_000),
+        ))
+        .json(&body)
+        .send()
+        .await?;
+    let status = response.status();
+    let value: Value = response.json().await.unwrap_or_else(|_| json!({}));
+    if !status.is_success() || value.get("ok").and_then(Value::as_bool) == Some(false) {
+        return Err(anyhow::anyhow!(
+            "Gemini vision worker failed with status {status}: {}",
+            value
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown error")
+        ));
+    }
+    let text = value
+        .get("text")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if text.is_empty() {
+        return Err(anyhow::anyhow!("Gemini vision worker returned empty text"));
+    }
+    Ok(GeminiOutput {
+        text,
+        images: Vec::new(),
+    })
+}
+
+struct PersistedGeneratedImage {
+    filename: String,
+    b64_json: String,
+    revised_prompt: Option<String>,
+}
+
+async fn persist_generated_images(
     state: &AppState,
     images: &[images::GeneratedImage],
-) -> Result<Vec<ImageData>, ApiError> {
+) -> Result<Vec<PersistedGeneratedImage>, ApiError> {
     tokio::fs::create_dir_all(&state.config.storage.images_path)
         .await
         .map_err(|error| ApiError::from(anyhow::anyhow!(error)))?;
     let mut out = Vec::new();
-    let public_base_url = state
-        .config
-        .image_generation
-        .public_base_url
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(|s| s.trim_end_matches('/').to_string());
     for image in images {
         let data = images::decode_image_b64(image).map_err(ApiError::from)?;
         let mut hasher = Sha256::new();
@@ -550,20 +719,37 @@ async fn save_generated_images(
                 .await
                 .map_err(|error| ApiError::from(anyhow::anyhow!(error)))?;
         }
-        let token = image_token(&filename, state.config.server.api_key.as_deref())
+        out.push(PersistedGeneratedImage {
+            filename,
+            b64_json: image.b64_json.clone(),
+            revised_prompt: image.revised_prompt.clone(),
+        });
+    }
+    Ok(out)
+}
+
+async fn save_generated_images(
+    state: &AppState,
+    images: &[images::GeneratedImage],
+) -> Result<Vec<ImageData>, ApiError> {
+    let public_base_url = configured_image_base_url(state);
+    let saved = persist_generated_images(state, images).await?;
+    let mut out = Vec::new();
+    for image in saved {
+        let token = image_token(&image.filename, state.config.server.api_key.as_deref())
             .map(|token| format!("?token={token}"))
             .unwrap_or_default();
         if let Some(base) = public_base_url.as_ref() {
             out.push(ImageData {
                 b64_json: None,
-                url: Some(format!("{base}/images/{filename}{token}")),
-                revised_prompt: image.revised_prompt.clone(),
+                url: Some(format!("{base}/images/{}{}", image.filename, token)),
+                revised_prompt: image.revised_prompt,
             });
         } else {
             out.push(ImageData {
-                b64_json: Some(image.b64_json.clone()),
+                b64_json: Some(image.b64_json),
                 url: None,
-                revised_prompt: image.revised_prompt.clone(),
+                revised_prompt: image.revised_prompt,
             });
         }
     }
@@ -743,6 +929,174 @@ fn append_text_only_image_guard(
     );
 }
 
+async fn generate_web_image_tool_output(
+    state: &AppState,
+    headers: &HeaderMap,
+    prompt: &str,
+) -> Result<String, ApiError> {
+    let output = state
+        .gemini
+        .generate_web_image_output(&state.config.image_generation.web_model, prompt)
+        .await
+        .map_err(ApiError::from)?;
+    if output.images.is_empty() {
+        let refusal = output.text.trim();
+        let detail = if refusal.is_empty() {
+            "Gemini Web returned no generated images".to_string()
+        } else {
+            format!("Gemini Web returned no generated images: {refusal}")
+        };
+        return Err(ApiError::from(anyhow::anyhow!(detail)));
+    }
+    append_image_markdown(state, headers, output.text, &output.images).await
+}
+
+fn image_tool_failure_message(detail: &str) -> String {
+    let lower = detail.to_ascii_lowercase();
+    if lower.contains("no generated image found before timeout")
+        || lower.contains("operation timed out")
+        || lower.contains("request timed out")
+    {
+        return "\u{751f}\u{56fe}\u{5931}\u{8d25}\u{ff1a}Gemini Web \u{5728} 120 \u{79d2}\u{5185}\u{6ca1}\u{6709}\u{751f}\u{6210}\u{56fe}\u{7247}\u{ff0c}\u{53ef}\u{80fd}\u{662f}\u{8d26}\u{53f7}/\u{5730}\u{533a}\u{9650}\u{5236}\u{6216}\u{5f53}\u{524d}\u{670d}\u{52a1}\u{5361}\u{4f4f}\u{3002}\u{6211}\u{5df2}\u{7ecf}\u{505c}\u{6b62}\u{7b49}\u{5f85}\u{ff0c}\u{907f}\u{514d}\u{62d6}\u{6162}\u{804a}\u{5929}\u{3002}".to_string();
+    }
+    if lower.contains("worker busy") {
+        return "\u{751f}\u{56fe}\u{5931}\u{8d25}\u{ff1a}\u{751f}\u{56fe} worker \u{6b63}\u{5fd9}\u{ff0c}\u{7a0d}\u{540e}\u{518d}\u{8bd5}\u{3002}".to_string();
+    }
+    format!("Image generation failed: {detail}")
+}
+
+fn image_tool_prompt(prompt: &str) -> String {
+    let trimmed = prompt.trim();
+    if let Some(start) = trimmed.rfind("<|im_start|>user") {
+        let after_start = &trimmed[start + "<|im_start|>user".len()..];
+        let after_start = after_start.strip_prefix('\n').unwrap_or(after_start);
+        let end = after_start.find("<|im_end|>").unwrap_or(after_start.len());
+        let candidate = after_start[..end].trim();
+        if !candidate.is_empty() {
+            return candidate.to_string();
+        }
+    }
+    trimmed.to_string()
+}
+
+async fn generate_backend_image_tool_output(
+    state: &AppState,
+    headers: &HeaderMap,
+    prompt: &str,
+) -> Result<String, ApiError> {
+    let request = ImageGenerationRequest {
+        model: Some(state.config.image_generation.model.clone()),
+        prompt: image_tool_prompt(prompt),
+        n: Some(1),
+        size: None,
+        quality: None,
+        response_format: None,
+        output_format: None,
+        user: None,
+    };
+    let images = images::generate_images(&state.http, &state.config.image_generation, &request)
+        .await
+        .map_err(ApiError::from)?;
+    append_generated_image_markdown(state, headers, "Image generated.".to_string(), &images).await
+}
+
+async fn generate_image_tool_output(
+    state: &AppState,
+    headers: &HeaderMap,
+    prompt: &str,
+) -> Result<String, ApiError> {
+    match state.config.image_generation.backend.as_str() {
+        "gemini_web" | "web" | "free_web" => {
+            generate_web_image_tool_output(state, headers, prompt).await
+        }
+        "auto" => match generate_web_image_tool_output(state, headers, prompt).await {
+            Ok(output) => Ok(output),
+            Err(web_error) => {
+                match generate_backend_image_tool_output(state, headers, prompt).await {
+                    Ok(output) => Ok(output),
+                    Err(backend_error) => Err(ApiError::from(anyhow::anyhow!(
+                        "Gemini Web failed first: {}; configured image backend failed: {}",
+                        web_error.detail,
+                        backend_error.detail
+                    ))),
+                }
+            }
+        },
+        _ => generate_backend_image_tool_output(state, headers, prompt).await,
+    }
+}
+
+fn explicit_image_generation_prompt(prompt: &str) -> bool {
+    let prompt = prompt.trim();
+    if prompt.is_empty() {
+        return false;
+    }
+    let prompt_lc = prompt.to_ascii_lowercase();
+    let negative = [
+        "do not draw",
+        "don't draw",
+        "dont draw",
+        "no image",
+        "\u{4e0d}\u{8981}\u{753b}",
+        "\u{4e0d}\u{7528}\u{753b}",
+        "\u{522b}\u{753b}",
+        "\u{4e0d}\u{8981}\u{751f}\u{6210}",
+        "\u{4e0d}\u{7528}\u{751f}\u{6210}",
+        "\u{522b}\u{751f}\u{6210}",
+    ];
+    if negative
+        .iter()
+        .any(|needle| prompt_lc.contains(needle) || prompt.contains(needle))
+    {
+        return false;
+    }
+
+    let english_intent = [
+        "generate an image",
+        "generate image",
+        "create an image",
+        "create image",
+        "make an image",
+        "draw an image",
+        "draw a picture",
+        "generate a picture",
+        "create a picture",
+        "draw me a",
+    ];
+    if english_intent
+        .iter()
+        .any(|needle| prompt_lc.contains(needle))
+    {
+        return true;
+    }
+
+    let chinese_intent = [
+        "\u{7ed9}\u{6211}\u{753b}\u{4e00}\u{5f20}",
+        "\u{5e2e}\u{6211}\u{753b}\u{4e00}\u{5f20}",
+        "\u{5e2e}\u{6211}\u{753b}\u{5f20}",
+        "\u{5e2e}\u{6211}\u{753b}\u{4e2a}",
+        "\u{8bf7}\u{7ed9}\u{6211}\u{753b}",
+        "\u{8bf7}\u{5e2e}\u{6211}\u{753b}",
+        "\u{753b}\u{4e00}\u{5f20}",
+        "\u{753b}\u{5f20}",
+        "\u{753b}\u{4e2a}",
+        "\u{751f}\u{6210}\u{4e00}\u{5f20}\u{56fe}",
+        "\u{751f}\u{6210}\u{4e00}\u{5f20}\u{56fe}\u{7247}",
+        "\u{5e2e}\u{6211}\u{751f}\u{6210}\u{4e00}\u{5f20}",
+        "\u{7ed9}\u{6211}\u{751f}\u{6210}\u{4e00}\u{5f20}",
+        "\u{751f}\u{6210}\u{56fe}\u{7247}",
+        "\u{751f}\u{6210}\u{56fe}\u{50cf}",
+        "\u{5e2e}\u{6211}\u{751f}\u{56fe}",
+        "\u{7ed9}\u{6211}\u{751f}\u{56fe}",
+        "\u{8bf7}\u{751f}\u{56fe}",
+        "\u{751f}\u{4e00}\u{5f20}\u{56fe}",
+        "\u{505a}\u{4e00}\u{5f20}\u{56fe}",
+        "\u{5236}\u{4f5c}\u{4e00}\u{5f20}\u{56fe}",
+        "\u{7ed8}\u{5236}\u{4e00}\u{5f20}",
+    ];
+    chinese_intent.iter().any(|needle| prompt.contains(needle))
+}
+
 fn should_use_image_tool(state: &AppState, model: &str, prompt: &str) -> bool {
     if !state.config.image_generation.is_enabled() {
         return false;
@@ -751,36 +1105,8 @@ fn should_use_image_tool(state: &AppState, model: &str, prompt: &str) -> bool {
     if model.contains("image") || model.contains("imagen") {
         return true;
     }
-    let prompt_lc = prompt.to_ascii_lowercase();
-    if [
-        "generate image",
-        "create image",
-        "make an image",
-        "draw an image",
-        "draw a picture",
-        "image of",
-        "picture of",
-    ]
-    .iter()
-    .any(|needle| prompt_lc.contains(needle))
-    {
-        return true;
-    }
-    let chinese_intent = [
-        "帮我画",
-        "画一张",
-        "画张",
-        "画个",
-        "生成图片",
-        "生成一张图",
-        "生成图",
-        "制作图片",
-        "生图",
-        "出图",
-        "绘制",
-    ];
-    chinese_intent.iter().any(|needle| prompt.contains(needle))
-        || (prompt.contains('画') && (prompt.contains('图') || prompt.contains("图片")))
+    let latest_user_prompt = image_tool_prompt(prompt);
+    explicit_image_generation_prompt(&latest_user_prompt)
 }
 
 fn trace_id_from_headers(headers: &HeaderMap) -> String {
@@ -815,27 +1141,141 @@ async fn chat_completions(
         !input.attachments.is_empty(),
         &mut input.prompt,
     );
+    let latest_user_text = latest_user_plain_text(&request.messages);
     let prompt = input.prompt;
     let model_name = request.model.clone();
     let completion_id = format!("chatcmpl-{}", Uuid::new_v4());
     let created = Utc::now().timestamp();
     let start = started();
     let trace_id = trace_id_from_headers(&headers);
-    let image_tool = should_use_image_tool(&state, &model_name, &prompt);
+    let image_tool = should_use_image_tool(&state, &model_name, &latest_user_text);
+    let use_worker_vision = !input.attachments.is_empty() && vision_worker_enabled(&state);
     tracing::info!(
         trace_id = %trace_id,
         model = %model_name,
         stream = request.stream.unwrap_or(false),
         prompt_chars = prompt.chars().count(),
         image_tool = image_tool,
+        vision_worker = use_worker_vision,
         "Gemini FastAPI chat request accepted"
     );
+    if use_worker_vision && request.stream.unwrap_or(false) {
+        let state_for_stream = state.clone();
+        let prompt_for_stream = prompt.clone();
+        let attachments_for_stream = input.attachments.clone();
+        let model_for_stream = model_name.clone();
+        let id = completion_id.clone();
+        let s = stream! {
+            let role = StreamChunk {
+                id: id.clone(),
+                object: "chat.completion.chunk",
+                created,
+                model: model_for_stream.clone(),
+                choices: vec![StreamChoice {
+                    index: 0,
+                    delta: json!({"role": "assistant"}),
+                    finish_reason: None,
+                }],
+                usage: None,
+            };
+            yield Ok::<_, std::convert::Infallible>(Event::default().data(serde_json::to_string(&role).unwrap()));
+
+            let vision_job = generate_vision_worker_output(
+                &state_for_stream,
+                &prompt_for_stream,
+                &attachments_for_stream,
+            );
+            tokio::pin!(vision_job);
+            let mut heartbeat = tokio::time::interval_at(
+                tokio::time::Instant::now() + std::time::Duration::from_secs(5),
+                std::time::Duration::from_secs(5),
+            );
+            let output_text = loop {
+                tokio::select! {
+                    result = &mut vision_job => {
+                        match result {
+                            Ok(output) => {
+                                state_for_stream.history.append(&HistoryRecord {
+                                    ts: timestamp(),
+                                    kind: "chat.completions.vision_worker",
+                                    model: &model_for_stream,
+                                    prompt_chars: prompt_for_stream.chars().count(),
+                                    output_chars: output.text.chars().count(),
+                                    latency_ms: start.elapsed().as_millis(),
+                                    ok: true,
+                                    error: None,
+                                });
+                                break output.text;
+                            }
+                            Err(error) => {
+                                let detail = error.to_string();
+                                state_for_stream.history.append(&HistoryRecord {
+                                    ts: timestamp(),
+                                    kind: "chat.completions.vision_worker",
+                                    model: &model_for_stream,
+                                    prompt_chars: prompt_for_stream.chars().count(),
+                                    output_chars: 0,
+                                    latency_ms: start.elapsed().as_millis(),
+                                    ok: false,
+                                    error: Some(&detail),
+                                });
+                                break format!("Gemini vision worker failed: {detail}");
+                            }
+                        }
+                    }
+                    _ = heartbeat.tick() => {
+                        yield Ok(Event::default().comment("keepalive"));
+                    }
+                }
+            };
+            let processed = process_output(&output_text);
+            let visible = processed.visible_text.unwrap_or_default();
+            if !visible.is_empty() {
+                let content = StreamChunk {
+                    id: id.clone(),
+                    object: "chat.completion.chunk",
+                    created,
+                    model: model_for_stream.clone(),
+                    choices: vec![StreamChoice {
+                        index: 0,
+                        delta: json!({"content": visible}),
+                        finish_reason: None,
+                    }],
+                    usage: None,
+                };
+                yield Ok(Event::default().data(serde_json::to_string(&content).unwrap()));
+            }
+            let prompt_tokens = estimate_tokens(&prompt_for_stream);
+            let completion_tokens = estimate_tokens(&processed.storage_text);
+            let done = StreamChunk {
+                id,
+                object: "chat.completion.chunk",
+                created,
+                model: model_for_stream.clone(),
+                choices: vec![StreamChoice {
+                    index: 0,
+                    delta: json!({}),
+                    finish_reason: Some(processed.finish_reason),
+                }],
+                usage: Some(Usage {
+                    prompt_tokens,
+                    completion_tokens,
+                    total_tokens: prompt_tokens + completion_tokens,
+                    prompt_tokens_details: Some(json!({"cached_tokens": 0})),
+                    completion_tokens_details: Some(json!({"reasoning_tokens": 0})),
+                }),
+            };
+            yield Ok(Event::default().data(serde_json::to_string(&done).unwrap()));
+            yield Ok(Event::default().data("[DONE]"));
+        };
+        return Ok(Sse::new(s).into_response());
+    }
     if image_tool && request.stream.unwrap_or(false) {
         let state_for_stream = state.clone();
         let headers_for_stream = headers.clone();
         let prompt_for_stream = prompt.clone();
+        let image_prompt_for_stream = latest_user_text.clone();
         let model_for_stream = model_name.clone();
-        let web_model = state.config.image_generation.web_model.clone();
         let id = completion_id.clone();
         let s = stream! {
             let role = StreamChunk {
@@ -853,60 +1293,33 @@ async fn chat_completions(
             yield Ok::<_, std::convert::Infallible>(Event::default().data(serde_json::to_string(&role).unwrap()));
 
             let image_job = async {
-                let result = state_for_stream
-                    .gemini
-                    .generate_web_image_output(&web_model, &prompt_for_stream)
-                    .await;
-                match result {
-                    Ok(output) => match append_image_markdown(
-                        &state_for_stream,
-                        &headers_for_stream,
-                        output.text,
-                        &output.images,
-                    )
-                    .await
-                    {
-                        Ok(output_text) => {
-                            state_for_stream.history.append(&HistoryRecord {
-                                ts: timestamp(),
-                                kind: "chat.completions.image_tool",
-                                model: &model_for_stream,
-                                prompt_chars: prompt_for_stream.chars().count(),
-                                output_chars: output_text.chars().count(),
-                                latency_ms: start.elapsed().as_millis(),
-                                ok: true,
-                                error: None,
-                            });
-                            output_text
-                        }
-                        Err(error) => {
-                            let detail = error.detail;
-                            state_for_stream.history.append(&HistoryRecord {
-                                ts: timestamp(),
-                                kind: "chat.completions.image_tool",
-                                model: &model_for_stream,
-                                prompt_chars: prompt_for_stream.chars().count(),
-                                output_chars: 0,
-                                latency_ms: start.elapsed().as_millis(),
-                                ok: false,
-                                error: Some(&detail),
-                            });
-                            format!("图片生成后保存失败：{detail}")
-                        }
-                    },
-                    Err(error) => {
-                        let detail = error.to_string();
+                match generate_image_tool_output(&state_for_stream, &headers_for_stream, &image_prompt_for_stream).await {
+                    Ok(output_text) => {
                         state_for_stream.history.append(&HistoryRecord {
                             ts: timestamp(),
                             kind: "chat.completions.image_tool",
                             model: &model_for_stream,
-                            prompt_chars: prompt_for_stream.chars().count(),
+                            prompt_chars: image_prompt_for_stream.chars().count(),
+                            output_chars: output_text.chars().count(),
+                            latency_ms: start.elapsed().as_millis(),
+                            ok: true,
+                            error: None,
+                        });
+                        output_text
+                    }
+                    Err(error) => {
+                        let detail = error.detail;
+                        state_for_stream.history.append(&HistoryRecord {
+                            ts: timestamp(),
+                            kind: "chat.completions.image_tool",
+                            model: &model_for_stream,
+                            prompt_chars: image_prompt_for_stream.chars().count(),
                             output_chars: 0,
                             latency_ms: start.elapsed().as_millis(),
                             ok: false,
                             error: Some(&detail),
                         });
-                        format!("图片生成失败：{detail}")
+                        format!("Image generation failed: {detail}")
                     }
                 }
             };
@@ -1170,54 +1583,83 @@ async fn chat_completions(
         return Ok(Sse::new(s).into_response());
     }
 
-    let generated = if image_tool {
-        state
-            .gemini
-            .generate_web_image_output(&state.config.image_generation.web_model, &prompt)
-            .await
-    } else {
-        state
-            .gemini
-            .generate_output(&model_name, &prompt, &input.attachments)
-            .await
-    };
-    let output = match generated {
-        Ok(output) => {
-            let output_text =
-                append_image_markdown(&state, &headers, output.text, &output.images).await?;
-            state.history.append(&HistoryRecord {
-                ts: timestamp(),
-                kind: if image_tool {
-                    "chat.completions.image_tool"
-                } else {
-                    "chat.completions"
-                },
-                model: &model_name,
-                prompt_chars: prompt.chars().count(),
-                output_chars: output_text.chars().count(),
-                latency_ms: start.elapsed().as_millis(),
-                ok: true,
-                error: None,
-            });
-            output_text
+    let output = if image_tool {
+        match generate_image_tool_output(&state, &headers, &latest_user_text).await {
+            Ok(output_text) => {
+                state.history.append(&HistoryRecord {
+                    ts: timestamp(),
+                    kind: "chat.completions.image_tool",
+                    model: &model_name,
+                    prompt_chars: latest_user_text.chars().count(),
+                    output_chars: output_text.chars().count(),
+                    latency_ms: start.elapsed().as_millis(),
+                    ok: true,
+                    error: None,
+                });
+                output_text
+            }
+            Err(error) => {
+                let detail = error.detail.clone();
+                state.history.append(&HistoryRecord {
+                    ts: timestamp(),
+                    kind: "chat.completions.image_tool",
+                    model: &model_name,
+                    prompt_chars: latest_user_text.chars().count(),
+                    output_chars: 0,
+                    latency_ms: start.elapsed().as_millis(),
+                    ok: false,
+                    error: Some(&detail),
+                });
+                image_tool_failure_message(&detail)
+            }
         }
-        Err(error) => {
-            let detail = error.to_string();
-            state.history.append(&HistoryRecord {
-                ts: timestamp(),
-                kind: if image_tool {
-                    "chat.completions.image_tool"
-                } else {
-                    "chat.completions"
-                },
-                model: &model_name,
-                prompt_chars: prompt.chars().count(),
-                output_chars: 0,
-                latency_ms: start.elapsed().as_millis(),
-                ok: false,
-                error: Some(&detail),
-            });
-            return Err(ApiError::from(error));
+    } else {
+        let generated = if use_worker_vision {
+            generate_vision_worker_output(&state, &prompt, &input.attachments).await
+        } else {
+            state
+                .gemini
+                .generate_output(&model_name, &prompt, &input.attachments)
+                .await
+        };
+        match generated {
+            Ok(output) => {
+                let output_text =
+                    append_image_markdown(&state, &headers, output.text, &output.images).await?;
+                state.history.append(&HistoryRecord {
+                    ts: timestamp(),
+                    kind: if use_worker_vision {
+                        "chat.completions.vision_worker"
+                    } else {
+                        "chat.completions"
+                    },
+                    model: &model_name,
+                    prompt_chars: prompt.chars().count(),
+                    output_chars: output_text.chars().count(),
+                    latency_ms: start.elapsed().as_millis(),
+                    ok: true,
+                    error: None,
+                });
+                output_text
+            }
+            Err(error) => {
+                let detail = error.to_string();
+                state.history.append(&HistoryRecord {
+                    ts: timestamp(),
+                    kind: if use_worker_vision {
+                        "chat.completions.vision_worker"
+                    } else {
+                        "chat.completions"
+                    },
+                    model: &model_name,
+                    prompt_chars: prompt.chars().count(),
+                    output_chars: 0,
+                    latency_ms: start.elapsed().as_millis(),
+                    ok: false,
+                    error: Some(&detail),
+                });
+                return Err(ApiError::from(error));
+            }
         }
     };
 
@@ -1367,54 +1809,84 @@ async fn create_response(
     let created = Utc::now().timestamp();
     let start = started();
     let image_tool = should_use_image_tool(&state, &request.model, &prompt);
-    let generated = if image_tool {
-        state
-            .gemini
-            .generate_web_image_output(&state.config.image_generation.web_model, &prompt)
-            .await
-    } else {
-        state
-            .gemini
-            .generate_output(&request.model, &prompt, &input.attachments)
-            .await
-    };
-    let output = match generated {
-        Ok(output) => {
-            let output_text =
-                append_image_markdown(&state, &headers, output.text, &output.images).await?;
-            state.history.append(&HistoryRecord {
-                ts: timestamp(),
-                kind: if image_tool {
-                    "responses.image_tool"
-                } else {
-                    "responses"
-                },
-                model: &request.model,
-                prompt_chars: prompt.chars().count(),
-                output_chars: output_text.chars().count(),
-                latency_ms: start.elapsed().as_millis(),
-                ok: true,
-                error: None,
-            });
-            output_text
+    let use_worker_vision = !input.attachments.is_empty() && vision_worker_enabled(&state);
+    let output = if image_tool {
+        match generate_image_tool_output(&state, &headers, &prompt).await {
+            Ok(output_text) => {
+                state.history.append(&HistoryRecord {
+                    ts: timestamp(),
+                    kind: "responses.image_tool",
+                    model: &request.model,
+                    prompt_chars: prompt.chars().count(),
+                    output_chars: output_text.chars().count(),
+                    latency_ms: start.elapsed().as_millis(),
+                    ok: true,
+                    error: None,
+                });
+                output_text
+            }
+            Err(error) => {
+                let detail = error.detail.clone();
+                state.history.append(&HistoryRecord {
+                    ts: timestamp(),
+                    kind: "responses.image_tool",
+                    model: &request.model,
+                    prompt_chars: prompt.chars().count(),
+                    output_chars: 0,
+                    latency_ms: start.elapsed().as_millis(),
+                    ok: false,
+                    error: Some(&detail),
+                });
+                return Err(error);
+            }
         }
-        Err(error) => {
-            let detail = error.to_string();
-            state.history.append(&HistoryRecord {
-                ts: timestamp(),
-                kind: if image_tool {
-                    "responses.image_tool"
-                } else {
-                    "responses"
-                },
-                model: &request.model,
-                prompt_chars: prompt.chars().count(),
-                output_chars: 0,
-                latency_ms: start.elapsed().as_millis(),
-                ok: false,
-                error: Some(&detail),
-            });
-            return Err(ApiError::from(error));
+    } else {
+        let generated = if use_worker_vision {
+            generate_vision_worker_output(&state, &prompt, &input.attachments).await
+        } else {
+            state
+                .gemini
+                .generate_output(&request.model, &prompt, &input.attachments)
+                .await
+        };
+        match generated {
+            Ok(output) => {
+                let output_text =
+                    append_image_markdown(&state, &headers, output.text, &output.images).await?;
+                state.history.append(&HistoryRecord {
+                    ts: timestamp(),
+                    kind: if use_worker_vision {
+                        "responses.vision_worker"
+                    } else {
+                        "responses"
+                    },
+                    model: &request.model,
+                    prompt_chars: prompt.chars().count(),
+                    output_chars: output_text.chars().count(),
+                    latency_ms: start.elapsed().as_millis(),
+                    ok: true,
+                    error: None,
+                });
+                output_text
+            }
+            Err(error) => {
+                let detail = error.to_string();
+                state.history.append(&HistoryRecord {
+                    ts: timestamp(),
+                    kind: if use_worker_vision {
+                        "responses.vision_worker"
+                    } else {
+                        "responses"
+                    },
+                    model: &request.model,
+                    prompt_chars: prompt.chars().count(),
+                    output_chars: 0,
+                    latency_ms: start.elapsed().as_millis(),
+                    ok: false,
+                    error: Some(&detail),
+                });
+                return Err(ApiError::from(error));
+            }
         }
     };
 
@@ -1591,10 +2063,58 @@ impl IntoResponse for ApiError {
 
 #[cfg(test)]
 mod tests {
-    use super::{append_text_only_image_guard, warm_generate_active_at};
+    use super::{
+        append_text_only_image_guard, explicit_image_generation_prompt, image_tool_prompt,
+        warm_generate_active_at,
+    };
 
     fn periods(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    #[test]
+    fn image_tool_prompt_uses_last_user_chatml_block() {
+        let prompt = "<|im_start|>system\nold rules\n<|im_end|>\n<|im_start|>user\n\u{5148}\u{804a}\u{70b9}\u{522b}\u{7684}\n<|im_end|>\n<|im_start|>assistant\nok\n<|im_end|>\n<|im_start|>user\n\u{5e2e}\u{6211}\u{753b}\u{4e00}\u{5f20}\u{732b}\u{56fe}\n<|im_end|>\n<|im_start|>assistant";
+        assert_eq!(
+            image_tool_prompt(prompt),
+            "\u{5e2e}\u{6211}\u{753b}\u{4e00}\u{5f20}\u{732b}\u{56fe}"
+        );
+
+        let prompt_with_old_image_request = "<|im_start|>user\n\u{7ed9}\u{6211}\u{753b}\u{4e00}\u{5f20}\u{7ea2}\u{8272}\u{5706}\u{5f62}\u{56fe}\u{6807}\n<|im_end|>\n<|im_start|>assistant\nok\n<|im_end|>\n<|im_start|>user\n\u{751f}\u{56fe}\u{8fd8}\u{6709}\u{62a5}\u{9519}\u{ff0c}\u{770b}\u{770b}\u{600e}\u{4e48}\u{529e}\n<|im_end|>\n<|im_start|>assistant";
+        let latest = image_tool_prompt(prompt_with_old_image_request);
+        assert_eq!(
+            latest,
+            "\u{751f}\u{56fe}\u{8fd8}\u{6709}\u{62a5}\u{9519}\u{ff0c}\u{770b}\u{770b}\u{600e}\u{4e48}\u{529e}"
+        );
+        assert!(!explicit_image_generation_prompt(&latest));
+    }
+
+    #[test]
+    fn explicit_image_generation_prompt_is_strict() {
+        assert!(explicit_image_generation_prompt(
+            "\u{7ed9}\u{6211}\u{753b}\u{4e00}\u{5f20}\u{7ea2}\u{8272}\u{5706}\u{5f62}\u{56fe}\u{6807}"
+        ));
+        assert!(explicit_image_generation_prompt(
+            "\u{5e2e}\u{6211}\u{751f}\u{6210}\u{4e00}\u{5f20}\u{767d}\u{5e95}\u{732b}\u{56fe}"
+        ));
+        assert!(explicit_image_generation_prompt(
+            "create an image of a red circle"
+        ));
+        assert!(!explicit_image_generation_prompt(
+            "\u{56fe}\u{91cc}\u{5199}\u{4e86}\u{4ec0}\u{4e48}\u{ff1f}"
+        ));
+        assert!(!explicit_image_generation_prompt(
+            "\u{5e2e}\u{6211}\u{770b}\u{770b}\u{8fd9}\u{5f20}\u{56fe}\u{7247}"
+        ));
+        assert!(!explicit_image_generation_prompt(
+            "\u{8fd9}\u{4e2a}\u{9875}\u{9762}\u{753b}\u{9762}\u{5f88}\u{602a}"
+        ));
+        assert!(!explicit_image_generation_prompt(
+            "\u{4e0d}\u{8981}\u{753b}\u{56fe}\u{ff0c}\u{7ed9}\u{6211}\u{6587}\u{5b57}\u{65b9}\u{6848}"
+        ));
+        assert!(!explicit_image_generation_prompt(
+            "\u{751f}\u{56fe}\u{8fd8}\u{6709}\u{62a5}\u{9519}\u{ff0c}\u{770b}\u{770b}\u{600e}\u{4e48}\u{529e}"
+        ));
     }
 
     #[test]

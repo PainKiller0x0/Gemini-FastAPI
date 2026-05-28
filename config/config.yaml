@@ -56,7 +56,7 @@ storage:
   retention_days: 14       # Number of days to retain conversations before cleanup
 
 image_generation:
-  backend: "disabled"       # "disabled", "gemini_web", "auto", "gemini_api", or "imagen_api"
+  backend: "disabled"       # "disabled", "gemini_web", "auto", "gemini_worker", "gemini_api", or "imagen_api"
   model: "gemini-3.1-flash-image-preview" # Gemini native image model; Imagen example: "imagen-4.0-generate-001"
   web_model: "gemini-3.5-flash" # Gemini Web chat model used by backend="gemini_web"
   api_key: null             # Prefer null and set GEMINI_API_KEY in the environment
@@ -64,6 +64,10 @@ image_generation:
   gemini_api_base_url: "https://generativelanguage.googleapis.com"
   imagen_api_base_url: "https://generativelanguage.googleapis.com"
   public_base_url: null     # Optional, e.g. "http://127.0.0.1:18000"; null returns b64_json directly
+  worker_url: null          # Optional Gemini Web worker URL for backend="gemini_worker" and vision fallback
+  worker_token: null        # Inline worker token; prefer worker_token_file in production
+  worker_token_file: null   # Optional file containing the worker token, e.g. "/run/secrets/gemini_worker_token"
+  worker_timeout_ms: 180000 # Worker request timeout; image generation can need a longer timeout
 
 logging:
   level: "INFO"            # Log level: DEBUG, INFO, WARNING, ERROR

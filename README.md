@@ -6,6 +6,13 @@
 
 [ English | [中文](README.zh.md) ]
 
+## PainKiller0x0 fork notes
+
+This fork keeps the original Python/FastAPI project for upstream compatibility, but the active nanobot deployment uses the Rust sidecar branch (`dev-rs`). The Rust path is designed for low-memory, Podman/systemd deployment and OpenAI-compatible access from OBP/nanobot.
+
+Key fork changes are documented in [README.rust.md](README.rust.md) and [docs/NANOBOT_ITERATION.md](docs/NANOBOT_ITERATION.md): custom Gemini Web model headers, temporary-chat mode, warmup/refresh, stricter image-tool routing, optional Gemini worker support, and no-secret runtime configuration.
+
+
 Web-based Gemini models wrapped into an OpenAI-compatible API. Powered by [HanaokaYuzu/Gemini-API](https://github.com/HanaokaYuzu/Gemini-API).
 
 **✅ Call Gemini's web-based models via API without an API Key, completely free!**

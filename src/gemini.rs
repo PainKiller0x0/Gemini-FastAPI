@@ -18,7 +18,6 @@ use regex::Regex;
 use reqwest::{
     Client,
     header::{CONTENT_TYPE, HeaderMap, HeaderValue, ORIGIN, REFERER, SET_COOKIE, USER_AGENT},
-    multipart,
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -32,9 +31,10 @@ const ENDPOINT_GOOGLE: &str = "https://www.google.com";
 const ENDPOINT_INIT: &str = "https://gemini.google.com/app";
 const ENDPOINT_GENERATE: &str = "https://gemini.google.com/_/BardChatUi/data/assistant.lamda.BardFrontendService/StreamGenerate";
 const ENDPOINT_BATCH_EXEC: &str = "https://gemini.google.com/_/BardChatUi/data/batchexecute";
-const ENDPOINT_UPLOAD: &str = "https://content-push.googleapis.com/upload";
+const ENDPOINT_UPLOAD: &str = "https://push.clients6.google.com/upload/";
 
 static TOKEN_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r#"\"SNlM0e\":\s*\"(.*?)\""#).unwrap());
+static THYKHD_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r#"\"thykhd\":\s*\"(.*?)\""#).unwrap());
 static BUILD_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r#"\"cfb2h\":\s*\"(.*?)\""#).unwrap());
 static SID_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r#"\"FdrFJe\":\s*\"(.*?)\""#).unwrap());
 static LANG_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r#"\"TuX5cc\":\s*\"(.*?)\""#).unwrap());
@@ -512,14 +512,20 @@ impl GeminiClient {
 
         let reqid = self.reqid.fetch_add(100_000, Ordering::Relaxed);
         let uuid = Uuid::new_v4().to_string().to_uppercase();
-        let language = request_language(&session.language, prompt, image_mode);
+        let input_attachment_mode = !attachments.is_empty();
+        let language = request_language(
+            &session.language,
+            prompt,
+            image_mode || input_attachment_mode,
+        );
 
         let inner = build_stream_generate_inner(
             prompt,
             language,
-            file_data,
+            file_data.clone(),
             &uuid,
             image_mode,
+            input_attachment_mode,
             self.temporary_chat,
         );
 
@@ -540,15 +546,18 @@ impl GeminiClient {
             );
         }
         add_web_required_headers(&mut request_headers);
-        if image_mode {
+        if image_mode || input_attachment_mode {
             add_image_tool_browser_headers(&mut request_headers);
             request_headers.insert(
                 "x-goog-ext-73010990-jspb",
                 HeaderValue::from_static("[0,0,0]"),
             );
-            if let Some(header) =
+            let model_header = if image_mode {
                 image_mode_model_header(&model, "F037BA73-BD98-4D15-8073-AE6F4E0BB60E")
-            {
+            } else {
+                input_attachment_model_header(&model, &uuid)
+            };
+            if let Some(header) = model_header {
                 request_headers
                     .insert("x-goog-ext-525001261-jspb", HeaderValue::from_str(&header)?);
             }
@@ -627,27 +636,69 @@ impl GeminiClient {
         let mut uploaded = Vec::new();
         for attachment in attachments {
             let (filename, content_type, data) = self.load_attachment(attachment).await?;
-            let part = multipart::Part::bytes(data)
-                .file_name(filename.clone())
-                .mime_str(&content_type)?;
-            let form = multipart::Form::new().part("file", part);
-            let response = self
+            let upload_url = self
                 .http
                 .post(ENDPOINT_UPLOAD)
                 .header("X-Tenant-Id", "bard-storage")
                 .header("Push-ID", push_id)
+                .header("X-Client-Pctx", "CgcSBWjK7pYx")
+                .header(
+                    "X-Goog-Upload-Header-Content-Length",
+                    data.len().to_string(),
+                )
+                .header("X-Goog-Upload-Header-Content-Type", content_type.as_str())
+                .header("Origin", "https://gemini.google.com")
+                .header("Referer", "https://gemini.google.com/")
+                .header("X-Goog-Upload-Protocol", "resumable")
+                .header("X-Goog-Upload-Command", "start")
+                .header(
+                    CONTENT_TYPE,
+                    "application/x-www-form-urlencoded;charset=utf-8",
+                )
                 .header("Cookie", session.cookie_header.clone())
-                .multipart(form)
+                .body(format!("File name: {filename}"))
+                .send()
+                .await?;
+            if !upload_url.status().is_success() {
+                return Err(anyhow!(
+                    "Gemini upload start failed with status {}",
+                    upload_url.status()
+                ));
+            }
+            let upload_url = upload_url
+                .headers()
+                .get("x-goog-upload-url")
+                .or_else(|| upload_url.headers().get("X-Goog-Upload-URL"))
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string)
+                .context("Gemini upload URL not found")?;
+
+            let response = self
+                .http
+                .post(upload_url)
+                .header("X-Tenant-Id", "bard-storage")
+                .header("Push-ID", push_id)
+                .header("X-Client-Pctx", "CgcSBWjK7pYx")
+                .header("X-Goog-Upload-Command", "upload, finalize")
+                .header("X-Goog-Upload-Offset", "0")
+                .header("Origin", "https://gemini.google.com")
+                .header("Referer", "https://gemini.google.com/")
+                .header(
+                    CONTENT_TYPE,
+                    "application/x-www-form-urlencoded;charset=utf-8",
+                )
+                .header("Cookie", session.cookie_header.clone())
+                .body(data)
                 .send()
                 .await?;
             if !response.status().is_success() {
                 return Err(anyhow!(
-                    "Gemini upload failed with status {}",
+                    "Gemini upload finalize failed with status {}",
                     response.status()
                 ));
             }
             let file_id = response.text().await?;
-            uploaded.push(json!([[file_id], filename]));
+            uploaded.push(json!([[file_id, 1, null, content_type], filename]));
         }
         Ok(Value::Array(uploaded))
     }
@@ -969,13 +1020,13 @@ impl GeminiClient {
             .batch_execute(session, "c8o8Fe", &serde_json::to_string(&payload)?)
             .await?;
         for frame in parse_frames(&raw) {
-            let Some(body_str) = get_path(&frame, &[2]).and_then(Value::as_str) else {
+            let Some(body_str) = get_path(&frame, &[2]).and_then(serde_json::Value::as_str) else {
                 continue;
             };
             let Ok(body) = serde_json::from_str::<Value>(body_str) else {
                 continue;
             };
-            if let Some(url) = get_path(&body, &[0]).and_then(Value::as_str) {
+            if let Some(url) = get_path(&body, &[0]).and_then(serde_json::Value::as_str) {
                 if !url.trim().is_empty() {
                     return Ok(Some(url.to_string()));
                 }
@@ -1081,7 +1132,9 @@ impl GeminiClient {
         let session_id = capture(&SID_RE, &body);
         let push_id = capture(&PUSH_RE, &body);
         let language = capture(&LANG_RE, &body).unwrap_or_else(|| "en".to_string());
-        let access_token = capture(&TOKEN_RE, &body).unwrap_or_default();
+        let access_token = capture(&TOKEN_RE, &body)
+            .or_else(|| capture(&THYKHD_RE, &body))
+            .unwrap_or_default();
         if access_token.is_empty() && build_label.is_none() && session_id.is_none() {
             return Err(anyhow!("Gemini init markers not found"));
         }
@@ -1279,9 +1332,11 @@ fn build_stream_generate_inner(
     file_data: Value,
     uuid: &str,
     image_mode: bool,
+    input_attachment_mode: bool,
     temporary_chat: bool,
 ) -> Vec<Value> {
-    let mut inner = vec![Value::Null; if image_mode { 81 } else { 69 }];
+    let multimodal_mode = image_mode || input_attachment_mode;
+    let mut inner = vec![Value::Null; if multimodal_mode { 81 } else { 69 }];
     inner[0] = json!([prompt, 0, null, file_data, null, null, 0]);
     inner[1] = json!([language]);
     inner[2] = json!(["", "", "", null, null, null, null, null, null, ""]);
@@ -1297,13 +1352,13 @@ fn build_stream_generate_inner(
     if temporary_chat {
         inner[45] = json!(1);
     }
-    if image_mode {
+    if multimodal_mode {
         inner[3] = json!(web_tool_nonce());
         inner[4] = json!(Uuid::new_v4().simple().to_string());
         inner[49] = json!(14);
         inner[67] = json!(0);
         inner[79] = json!(1);
-        inner[80] = json!(2);
+        inner[80] = json!(if image_mode { 2 } else { 1 });
     }
     inner[53] = json!(0);
     inner[59] = json!(uuid);
@@ -1409,11 +1464,19 @@ fn add_image_tool_browser_headers(headers: &mut HeaderMap) {
 }
 
 fn image_mode_model_header(model: &GeminiModel, request_uuid: &str) -> Option<String> {
+    multimodal_model_header(model, request_uuid, 2)
+}
+
+fn input_attachment_model_header(model: &GeminiModel, request_uuid: &str) -> Option<String> {
+    multimodal_model_header(model, request_uuid, 1)
+}
+
+fn multimodal_model_header(model: &GeminiModel, request_uuid: &str, mode: i64) -> Option<String> {
     let raw = model.model_header.get("x-goog-ext-525001261-jspb")?;
     let parsed = serde_json::from_str::<Value>(raw).ok()?;
-    let model_id = get_path(&parsed, &[4]).and_then(Value::as_str)?;
+    let model_id = get_path(&parsed, &[4]).and_then(serde_json::Value::as_str)?;
     Some(format!(
-        r#"[1,null,null,null,"{model_id}",null,null,0,[4,5,6,8],null,null,2,null,null,1,2,"{request_uuid}"]"#
+        r#"[1,null,null,null,"{model_id}",null,null,0,[4,5,6,8],null,null,2,null,null,1,{mode},"{request_uuid}"]"#
     ))
 }
 
@@ -1627,7 +1690,7 @@ fn starts_like_tool_block(text: &str) -> bool {
 }
 
 fn extract_partial_text_from_frame(frame: &Value) -> Option<String> {
-    let inner = get_path(frame, &[2]).and_then(Value::as_str)?;
+    let inner = get_path(frame, &[2]).and_then(serde_json::Value::as_str)?;
     let parsed_inner = serde_json::from_str::<Value>(inner).ok()?;
     let candidates = get_path(&parsed_inner, &[4]).and_then(Value::as_array)?;
     candidates.iter().filter_map(candidate_text).last()
@@ -1636,13 +1699,13 @@ fn extract_partial_text_from_frame(frame: &Value) -> Option<String> {
 fn candidate_text(candidate: &Value) -> Option<String> {
     get_path(candidate, &[1, 0])
         .or_else(|| get_path(candidate, &[22, 0]))
-        .and_then(Value::as_str)
+        .and_then(serde_json::Value::as_str)
         .filter(|value| !value.trim().is_empty())
         .map(ToString::to_string)
 }
 
 fn classify_response_frame(frame: &Value) -> &'static str {
-    let Some(inner) = get_path(frame, &[2]).and_then(Value::as_str) else {
+    let Some(inner) = get_path(frame, &[2]).and_then(serde_json::Value::as_str) else {
         return "no_inner";
     };
     let Ok(parsed_inner) = serde_json::from_str::<Value>(inner) else {
@@ -1673,28 +1736,28 @@ fn extract_output_from_response(raw: &str) -> anyhow::Result<GeminiOutput> {
     }
     let mut output = GeminiOutput::default();
     for frame in frames {
-        let Some(inner) = get_path(&frame, &[2]).and_then(Value::as_str) else {
+        let Some(inner) = get_path(&frame, &[2]).and_then(serde_json::Value::as_str) else {
             continue;
         };
         let Ok(parsed_inner) = serde_json::from_str::<Value>(inner) else {
             continue;
         };
         let cid = get_path(&parsed_inner, &[1, 0])
-            .and_then(Value::as_str)
+            .and_then(serde_json::Value::as_str)
             .map(ToString::to_string);
         let rid = get_path(&parsed_inner, &[1, 1])
-            .and_then(Value::as_str)
+            .and_then(serde_json::Value::as_str)
             .map(ToString::to_string);
         let Some(candidates) = get_path(&parsed_inner, &[4]).and_then(Value::as_array) else {
             continue;
         };
         for candidate in candidates {
             let rcid = get_path(candidate, &[0])
-                .and_then(Value::as_str)
+                .and_then(serde_json::Value::as_str)
                 .map(ToString::to_string);
             if let Some(text) = get_path(candidate, &[1, 0])
                 .or_else(|| get_path(candidate, &[22, 0]))
-                .and_then(Value::as_str)
+                .and_then(serde_json::Value::as_str)
             {
                 if !text.trim().is_empty() {
                     output.text = text.to_string();
@@ -1706,12 +1769,14 @@ fn extract_output_from_response(raw: &str) -> anyhow::Result<GeminiOutput> {
                 .flatten()
                 .enumerate()
             {
-                if let Some(url) = get_path(web_image, &[0, 0, 0]).and_then(Value::as_str) {
+                if let Some(url) =
+                    get_path(web_image, &[0, 0, 0]).and_then(serde_json::Value::as_str)
+                {
                     output.images.push(GeminiImage {
                         url: url.to_string(),
                         title: format!("[Image {}]", idx + 1),
                         alt: get_path(web_image, &[0, 4])
-                            .and_then(Value::as_str)
+                            .and_then(serde_json::Value::as_str)
                             .unwrap_or("")
                             .to_string(),
                         generated: false,
@@ -1723,9 +1788,11 @@ fn extract_output_from_response(raw: &str) -> anyhow::Result<GeminiOutput> {
                 }
             }
             for (idx, gen_image) in generated_image_values(candidate).into_iter().enumerate() {
-                if let Some(url) = get_path(gen_image, &[0, 3, 3]).and_then(Value::as_str) {
+                if let Some(url) =
+                    get_path(gen_image, &[0, 3, 3]).and_then(serde_json::Value::as_str)
+                {
                     let image_id = get_path(gen_image, &[1, 0])
-                        .and_then(Value::as_str)
+                        .and_then(serde_json::Value::as_str)
                         .map(ToString::to_string)
                         .or_else(|| {
                             Some(format!(
@@ -1736,7 +1803,7 @@ fn extract_output_from_response(raw: &str) -> anyhow::Result<GeminiOutput> {
                         url: url.to_string(),
                         title: format!("[Generated Image {}]", idx + 1),
                         alt: get_path(gen_image, &[0, 3, 2])
-                            .and_then(Value::as_str)
+                            .and_then(serde_json::Value::as_str)
                             .unwrap_or("")
                             .to_string(),
                         generated: true,
@@ -1884,7 +1951,7 @@ fn extract_runtime_models(raw: &str) -> anyhow::Result<Vec<GeminiModel>> {
     let frames = parse_frames(raw);
     let mut out = Vec::new();
     for frame in frames {
-        let Some(body_str) = get_path(&frame, &[2]).and_then(Value::as_str) else {
+        let Some(body_str) = get_path(&frame, &[2]).and_then(serde_json::Value::as_str) else {
             continue;
         };
         let Ok(body) = serde_json::from_str::<Value>(body_str) else {
@@ -1907,13 +1974,13 @@ fn extract_runtime_models(raw: &str) -> anyhow::Result<Vec<GeminiModel>> {
         };
         for model_data in models {
             let Some(model_id) = get_path(model_data, &[0])
-                .and_then(Value::as_str)
+                .and_then(serde_json::Value::as_str)
                 .filter(|s| !s.is_empty())
             else {
                 continue;
             };
             let display_name = get_path(model_data, &[1])
-                .and_then(Value::as_str)
+                .and_then(serde_json::Value::as_str)
                 .unwrap_or("");
             let model_name = runtime_model_name(model_id, display_name);
             if model_name.is_empty() {
@@ -2090,7 +2157,8 @@ mod tests {
 
     #[test]
     fn stream_generate_inner_keeps_normal_chat_saved_by_default() {
-        let inner = build_stream_generate_inner("hello", "en", Value::Null, "UUID", false, false);
+        let inner =
+            build_stream_generate_inner("hello", "en", Value::Null, "UUID", false, false, false);
 
         assert_eq!(inner.len(), 69);
         assert_eq!(inner[0], json!(["hello", 0, null, null, null, null, 0]));
@@ -2099,7 +2167,8 @@ mod tests {
 
     #[test]
     fn stream_generate_inner_sets_temporary_chat_flag() {
-        let inner = build_stream_generate_inner("hello", "en", Value::Null, "UUID", false, true);
+        let inner =
+            build_stream_generate_inner("hello", "en", Value::Null, "UUID", false, false, true);
 
         assert_eq!(inner.len(), 69);
         assert_eq!(inner[45], json!(1));
@@ -2107,12 +2176,55 @@ mod tests {
 
     #[test]
     fn stream_generate_inner_sets_temporary_chat_flag_in_image_mode() {
-        let inner =
-            build_stream_generate_inner("draw a cat", "zh-CN", Value::Null, "UUID", true, true);
+        let inner = build_stream_generate_inner(
+            "draw a cat",
+            "zh-CN",
+            Value::Null,
+            "UUID",
+            true,
+            false,
+            true,
+        );
 
         assert_eq!(inner.len(), 81);
         assert_eq!(inner[17], json!([[0]]));
         assert_eq!(inner[45], json!(1));
+    }
+
+    #[test]
+    fn stream_generate_inner_sets_input_attachment_mode() {
+        let file_data = json!([[
+            ["/contrib_service/ttl_1d/test", 1, null, "image/png"],
+            "image.png"
+        ]]);
+        let inner = build_stream_generate_inner(
+            "describe this",
+            "zh-CN",
+            file_data.clone(),
+            "UUID",
+            false,
+            true,
+            false,
+        );
+
+        assert_eq!(inner.len(), 81);
+        assert_eq!(
+            inner[0],
+            json!(["describe this", 0, null, file_data, null, null, 0])
+        );
+        assert_eq!(
+            inner[2],
+            json!(["", "", "", null, null, null, null, null, null, ""])
+        );
+        assert!(
+            inner[3]
+                .as_str()
+                .is_some_and(|value| value.starts_with('!'))
+        );
+        assert_eq!(inner[6], json!([1]));
+        assert_eq!(inner[10], json!(1));
+        assert_eq!(inner[68], json!(2));
+        assert_eq!(inner[80], json!(1));
     }
 
     #[test]

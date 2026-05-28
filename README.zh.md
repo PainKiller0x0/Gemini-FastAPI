@@ -6,6 +6,13 @@
 
 [ [English](README.md) | 中文 ]
 
+## PainKiller0x0 fork 说明
+
+这个 fork 保留上游 Python/FastAPI 实现，方便继续对齐 [Nativu5/Gemini-FastAPI](https://github.com/Nativu5/Gemini-FastAPI)。但当前给 nanobot 正式使用的是 `dev-rs` 分支里的 Rust sidecar：常驻内存更低，适合 Podman/systemd 部署，并通过 OpenAI 兼容接口接入 OBP/nanobot。
+
+我们自己的迭代重点已经整理到 [README.rust.md](README.rust.md) 和 [docs/NANOBOT_ITERATION.md](docs/NANOBOT_ITERATION.md)：自定义 Gemini Web 模型头、临时对话模式、预热/刷新、严格图片工具路由、可选 Gemini worker、生图/视觉处理隔离，以及不把 Cookie、Token 写进仓库的运行配置。
+
+
 将 Gemini 网页端模型封装为兼容 OpenAI API 的 API Server。基于 [HanaokaYuzu/Gemini-API](https://github.com/HanaokaYuzu/Gemini-API) 实现。
 
 **✅ 无需 API Key，免费通过 API 调用 Gemini 网页端模型！**
