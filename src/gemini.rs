@@ -1003,7 +1003,34 @@ impl GeminiClient {
         rcid: &str,
         image_id: &str,
     ) -> anyhow::Result<Option<String>> {
-        let payload = json!([
+        let mut last_error = None;
+        for payload in Self::full_size_image_payloads(cid, rid, rcid, image_id) {
+            let raw = match self
+                .batch_execute(session, "c8o8Fe", &serde_json::to_string(&payload)?)
+                .await
+            {
+                Ok(raw) => raw,
+                Err(error) => {
+                    tracing::debug!(?error, "Gemini c8o8Fe full-size image RPC failed");
+                    last_error = Some(error);
+                    continue;
+                }
+            };
+            if let Some(url) = GeminiClient::extract_full_size_image_url(&raw) {
+                return Ok(Some(url));
+            }
+        }
+        if let Some(error) = last_error {
+            tracing::debug!(
+                ?error,
+                "Gemini c8o8Fe full-size image RPC exhausted fallbacks"
+            );
+        }
+        Ok(None)
+    }
+
+    fn full_size_image_payloads(cid: &str, rid: &str, rcid: &str, image_id: &str) -> Vec<Value> {
+        let image_request = json!([
             [null, null, null, [null, null, null, null, null, ""]],
             [image_id, 0],
             null,
@@ -1015,24 +1042,56 @@ impl GeminiClient {
             null,
             "",
         ]);
-        let payload = json!([payload, [rid, rcid, cid, null, ""], 1, 0, 1]);
-        let raw = self
-            .batch_execute(session, "c8o8Fe", &serde_json::to_string(&payload)?)
-            .await?;
-        for frame in parse_frames(&raw) {
+        vec![
+            json!([image_request, [rid, rcid, cid, null, ""], 1, 0, 1]),
+            json!([image_id, [rid, rcid, cid, null, ""], 1, 0, 1]),
+            json!([[image_id, 0], [rid, rcid, cid, null, ""], 1, 0, 1]),
+        ]
+    }
+
+    fn extract_full_size_image_url(raw: &str) -> Option<String> {
+        for frame in parse_frames(raw) {
             let Some(body_str) = get_path(&frame, &[2]).and_then(serde_json::Value::as_str) else {
                 continue;
             };
             let Ok(body) = serde_json::from_str::<Value>(body_str) else {
                 continue;
             };
-            if let Some(url) = get_path(&body, &[0]).and_then(serde_json::Value::as_str) {
-                if !url.trim().is_empty() {
-                    return Ok(Some(url.to_string()));
-                }
+            if let Some(url) = Self::find_generated_image_url(&body) {
+                return Some(url);
             }
         }
-        Ok(None)
+        None
+    }
+
+    fn find_generated_image_url(value: &Value) -> Option<String> {
+        match value {
+            Value::String(text) => Self::generated_image_url(text),
+            Value::Array(items) => items.iter().find_map(Self::find_generated_image_url),
+            Value::Object(map) => map.values().find_map(Self::find_generated_image_url),
+            _ => None,
+        }
+    }
+
+    fn generated_image_url(text: &str) -> Option<String> {
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        let lower = trimmed.to_ascii_lowercase();
+        if !(lower.starts_with("http://") || lower.starts_with("https://")) {
+            return None;
+        }
+        if lower.contains("googleusercontent.com")
+            && (lower.contains("image_generation")
+                || lower.contains("=d")
+                || lower.contains("s2048")
+                || lower.contains("s1024"))
+        {
+            Some(trimmed.to_string())
+        } else {
+            None
+        }
     }
 
     async fn batch_execute(
@@ -2100,7 +2159,7 @@ fn ext_from_content_type(content_type: &str) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_stream_generate_inner, contains_cjk, extract_partial_text_from_frame,
+        GeminiClient, build_stream_generate_inner, contains_cjk, extract_partial_text_from_frame,
         parse_frames_from, request_language,
     };
     use serde_json::{Value, json};
@@ -2225,6 +2284,35 @@ mod tests {
         assert_eq!(inner[10], json!(1));
         assert_eq!(inner[68], json!(2));
         assert_eq!(inner[80], json!(1));
+    }
+
+    #[test]
+    fn c8o8fe_extracts_nested_full_size_image_url() {
+        let url = "https://lh3.googleusercontent.com/image_generation_content/abc=s2048-rj";
+        let body = json!([null, {"nested": [["ignore"], [url]]}]).to_string();
+        let raw = encoded_frame(json!([null, null, body]));
+
+        assert_eq!(
+            GeminiClient::extract_full_size_image_url(&raw).as_deref(),
+            Some(url)
+        );
+    }
+
+    #[test]
+    fn c8o8fe_payloads_cover_known_generated_image_shapes() {
+        let payloads = GeminiClient::full_size_image_payloads("cid", "rid", "rcid", "image-id");
+
+        assert!(payloads.len() >= 3);
+        assert!(
+            payloads
+                .iter()
+                .all(|payload| payload.to_string().contains("image-id"))
+        );
+        assert!(
+            payloads
+                .iter()
+                .all(|payload| payload.to_string().contains("rcid"))
+        );
     }
 
     #[test]

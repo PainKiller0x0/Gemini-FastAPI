@@ -58,8 +58,10 @@ Goals:
 - `response_format` 的 `json_object` / `json_schema` 指令支持
 - OpenAI Chat / Responses 的文本、流式、工具调用兼容
 - OpenAI image/file input 收集和 Gemini content-push 上传路径
+- Chat/Responses 路由决策已抽到 `src/routing.rs`：集中判断走普通 Gemini、vision worker，还是 image tool
 - 严格生图意图判断：只有最新用户消息明确要求生成/绘制图片，才进入图片工具
 - 图片生成后端：`disabled`、`gemini_web`、`auto`、`gemini_worker`、`gemini_api`、`imagen_api`
+- 更完整的 generated-image RPC (`c8o8Fe`)：会尝试多种 payload 形态，并从嵌套响应中解析全尺寸图片 URL；失败时仍回落到预览图下载
 - 视觉识图/OCR worker：配置 `worker_url` + `worker_token_file` 后，图片附件可走 `/vision`
 - JSONL 请求历史：`storage.path/rust-history.jsonl`
 - Gemini session refresh 和可选真实 warmup，降低冷启动长尾延迟
@@ -84,8 +86,10 @@ Goals:
 - `response_format` support for `json_object` and `json_schema` instructions
 - OpenAI Chat / Responses text, streaming, and tool-compatible responses
 - OpenAI image/file input collection and Gemini content-push upload path
+- Chat/Responses routing decisions live in `src/routing.rs`, centralizing the choice between normal Gemini, vision worker, and image tool
 - Strict image intent detection: image tools are used only when the latest user message explicitly asks to generate/draw/create an image
 - Image backends: `disabled`, `gemini_web`, `auto`, `gemini_worker`, `gemini_api`, `imagen_api`
+- Fuller generated-image RPC (`c8o8Fe`) support: tries multiple payload shapes and recursively extracts full-size image URLs from nested responses; preview download remains the fallback
 - Vision/OCR worker path via `worker_url` + `worker_token_file`, using `/vision` for image attachments
 - JSONL request history at `storage.path/rust-history.jsonl`
 - Gemini session refresh and optional real warmup to reduce cold-start tail latency
@@ -266,25 +270,23 @@ This isolates slow/high-risk vision paths from normal text chat.
 ## 仍在迁移 / 后续可做
 
 - Python 兼容的会话复用和历史 metadata 语义。
-- 更完整的 generated-image RPC (`c8o8Fe`) 支持。
 - Google `RotateCookies` endpoint。
 - Deep Research / Gems 等专用路径。
-- 把 Chat/Responses 路由决策从 `src/main.rs` 继续提成更深的 Module。
+- 如果 `src/main.rs` 继续膨胀，下一步优先拆 SSE chunk 构造，而不是再拆浅工具函数。
 
 ## Still Being Ported / Future Work
 
 - Python-compatible conversation reuse and history metadata semantics.
-- Fuller generated-image RPC (`c8o8Fe`) support.
 - Google `RotateCookies` endpoint support.
 - Deep Research / Gems-specific paths.
-- Further extraction of Chat/Responses routing decisions from `src/main.rs` into a deeper module.
+- If `src/main.rs` keeps growing, the next useful extraction is SSE chunk construction, not more shallow helper functions.
 
 ## 回测清单
 
 最近一次回测项：
 
 - `cargo fmt -- --check`
-- `cargo test --locked`
+- `cargo test --locked`，当前 21 个测试
 - `cargo build --release --locked`
 - 无认证 `/v1/models` 返回 `401`
 - `/health` 返回 `implementation=rust`
@@ -301,7 +303,7 @@ This isolates slow/high-risk vision paths from normal text chat.
 Latest verification scope:
 
 - `cargo fmt -- --check`
-- `cargo test --locked`
+- `cargo test --locked`, currently 21 tests
 - `cargo build --release --locked`
 - unauthenticated `/v1/models` returns `401`
 - `/health` reports `implementation=rust`

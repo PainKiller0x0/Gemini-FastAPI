@@ -17,6 +17,7 @@
 | HTTP shell | `src/main.rs` | OpenAI compatible routes: `/health`、`/v1/models`、`/v1/chat/completions`、`/v1/responses`、`/v1/images/generations` | 负责认证、请求编排、SSE 输出、历史记录和错误转换 |
 | Gemini Web adapter | `src/gemini.rs` | `GeminiPool::generate_output*`、模型发现、session refresh/warmup | 隐藏 Gemini Web RPC、Cookie、上传、临时对话、流式解析细节 |
 | OpenAI protocol adapter | `src/openai.rs` | request/response 类型、prompt 转换、tool call 解析、token 估算 | 把 OpenAI/Responses 形态转成 Gemini 输入，再把 Gemini 输出转回兼容格式 |
+| Request routing | `src/routing.rs` | `choose_generation_route`、`GenerationRoute`、严格生图意图判断 | 集中决定请求走普通 Gemini、vision worker 还是 image tool |
 | Image generation adapter | `src/images.rs` | `generate_images` + `ImageGenerationConfig` | 根据 `backend` 分发到 Gemini Web worker、Gemini API、Imagen API 等后端 |
 | Runtime config | `src/config.rs` | YAML + env path config structs | 提供运行时 seam；真实 secret 不落仓库 |
 | History ledger | `src/history.rs` | `HistoryStore::append` | 用 JSONL 记录每次请求的 kind/model/latency/error，给 OBP/排障使用 |
@@ -33,11 +34,11 @@
 两者共享这些公共实现：
 
 - `append_text_only_image_guard`：当图片后端关闭时，阻止 Gemini Web 自己谈“无法生图/未登录/地区不可用”。
-- `should_use_image_tool` + `explicit_image_generation_prompt`：只看最新用户意图决定是否进入图片工具。
+- `src/routing.rs` 的 `choose_generation_route`：只看最新用户意图、附件和 worker 状态，决定进入普通 Gemini、vision worker 或 image tool。
 - `record_history`：统一写入历史账本，避免每条路径重复构造 `HistoryRecord`。
 - `usage_for`：统一 token usage 估算格式。
 
-后续如果继续减少 `main.rs` 体积，优先把 Chat/Responses 的“路由决策”提成独立 Module，而不是先拆出很多只有一层转发的小函数。
+Chat/Responses 的“路由决策”已经提成 `src/routing.rs`。后续如果继续减少 `main.rs` 体积，优先提取 SSE chunk 构造，而不是先拆出很多只有一层转发的小函数。
 
 ### 2. Gemini Web adapter seam
 
@@ -62,7 +63,7 @@
 
 当前图片相关分两类：
 
-- **生成图片**：`/v1/images/generations` 或显式生图 prompt，走 `src/images.rs` 的 `generate_images`。
+- **生成图片**：`/v1/images/generations` 或显式生图 prompt，走 `src/images.rs` 的 `generate_images`；Gemini Web 生成图下载会优先尝试 `c8o8Fe` 全尺寸 RPC，失败再回落预览图 URL。
 - **识图/OCR/视觉附件**：Chat/Responses 有附件时，如果配置了 worker，则走 `generate_vision_worker_output`。
 
 设计约束：
@@ -123,7 +124,7 @@ flowchart LR
 
 ## 当前已知技术债
 
-1. `src/main.rs` 仍然偏大。下一步最值得拆的是 Chat/Responses 路由决策，而不是继续拆纯工具函数。
+1. `src/main.rs` 仍然偏大，但路由决策已经移出；下一步如果要继续瘦身，优先考虑 SSE chunk 构造。
 2. SSE chunk 构造仍有重复。可以提一个 `chat_stream_chunk` Module，但要小心别让 Interface 反而比 Implementation 更复杂。
 3. worker contract 目前是约定式 JSON，还没有独立类型。等 worker 稳定后可以把 request/response 类型放进 `src/images.rs`。
 4. `gemini.rs` 很深但也很长。它是合理的深 Module，后续拆分要按 Gemini Web 子概念拆，比如 session、upload、frame parser，而不是机械按行数拆。

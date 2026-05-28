@@ -20,7 +20,9 @@
 | 流式输出 | OpenAI SSE 兼容输出，Gemini 响应后按 chunk 发出 | 保持客户端兼容，QQ/OBP 可直接接 |
 | 多模态输入 | 支持 OpenAI image/file input 收集，走 Gemini content-push 或 worker 视觉路径 | 让图片理解链路可用 |
 | 图片生成 | 支持 `disabled`、`gemini_web`、`auto`、`gemini_worker`、`gemini_api`、`imagen_api` | 允许按成本/稳定性选择不同后端 |
+| 路由决策 | `src/routing.rs` 统一选择普通 Gemini、vision worker 或 image tool | Chat/Responses 不再各自散落判断逻辑 |
 | 图片工具防误触 | 只根据“最新用户消息”的明确生图意图触发图片链路；“画面很怪”“画 UI 很烦”“生图报错”不会触发 | 解决闲聊被回复“您登录了吗/地区未开放”的问题 |
+| 生成图全尺寸 | `c8o8Fe` 支持多 payload 形态和嵌套 URL 解析，失败再回落预览图 | 提高 Gemini Web 生图落盘质量 |
 | Worker 隔离 | `worker_url` + `worker_token_file` 可把生图/视觉任务交给单独 worker | 把高风险慢路径和普通聊天隔离 |
 | 安全配置 | 示例配置只放占位符；真实 Cookie、API Key、worker token 放运行时配置 | 避免 secret 进 Git |
 
@@ -60,9 +62,10 @@ image_generation:
 - `cargo build --release --locked`
 - `/health` 返回 Rust 实现和可用 client。
 - `/v1/models` 能列出 `gemini-3.5-flash`、`gemini-3.1-pro` 等别名。
-- 普通聊天不触发 image tool。
+- 普通聊天不触发 image tool，附件识图可走 vision worker。
 - 明确“帮我画一张...”才触发图片链路。
 - “画面/图片/生图报错/画 UI 很烦”这类文本讨论仍然走普通聊天。
+- `c8o8Fe` 全尺寸图片 URL 解析单测通过。
 
 ## 暂不做
 

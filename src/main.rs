@@ -3,6 +3,7 @@ mod gemini;
 mod history;
 mod images;
 mod openai;
+mod routing;
 
 use std::{
     collections::HashMap, env, fs as std_fs, path::Path as FsPath, sync::Arc, time::UNIX_EPOCH,
@@ -32,6 +33,7 @@ use openai::{
     messages_to_gemini_input, process_output, response_extra_instructions,
     response_input_to_gemini_input,
 };
+use routing::{GenerationRoute, RouteRequest, choose_generation_route, image_tool_prompt};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio::net::TcpListener;
@@ -965,20 +967,6 @@ fn image_tool_failure_message(detail: &str) -> String {
     format!("Image generation failed: {detail}")
 }
 
-fn image_tool_prompt(prompt: &str) -> String {
-    let trimmed = prompt.trim();
-    if let Some(start) = trimmed.rfind("<|im_start|>user") {
-        let after_start = &trimmed[start + "<|im_start|>user".len()..];
-        let after_start = after_start.strip_prefix('\n').unwrap_or(after_start);
-        let end = after_start.find("<|im_end|>").unwrap_or(after_start.len());
-        let candidate = after_start[..end].trim();
-        if !candidate.is_empty() {
-            return candidate.to_string();
-        }
-    }
-    trimmed.to_string()
-}
-
 async fn generate_backend_image_tool_output(
     state: &AppState,
     headers: &HeaderMap,
@@ -1024,89 +1012,6 @@ async fn generate_image_tool_output(
         },
         _ => generate_backend_image_tool_output(state, headers, prompt).await,
     }
-}
-
-fn explicit_image_generation_prompt(prompt: &str) -> bool {
-    let prompt = prompt.trim();
-    if prompt.is_empty() {
-        return false;
-    }
-    let prompt_lc = prompt.to_ascii_lowercase();
-    let negative = [
-        "do not draw",
-        "don't draw",
-        "dont draw",
-        "no image",
-        "\u{4e0d}\u{8981}\u{753b}",
-        "\u{4e0d}\u{7528}\u{753b}",
-        "\u{522b}\u{753b}",
-        "\u{4e0d}\u{8981}\u{751f}\u{6210}",
-        "\u{4e0d}\u{7528}\u{751f}\u{6210}",
-        "\u{522b}\u{751f}\u{6210}",
-    ];
-    if negative
-        .iter()
-        .any(|needle| prompt_lc.contains(needle) || prompt.contains(needle))
-    {
-        return false;
-    }
-
-    let english_intent = [
-        "generate an image",
-        "generate image",
-        "create an image",
-        "create image",
-        "make an image",
-        "draw an image",
-        "draw a picture",
-        "generate a picture",
-        "create a picture",
-        "draw me a",
-    ];
-    if english_intent
-        .iter()
-        .any(|needle| prompt_lc.contains(needle))
-    {
-        return true;
-    }
-
-    let chinese_intent = [
-        "\u{7ed9}\u{6211}\u{753b}\u{4e00}\u{5f20}",
-        "\u{5e2e}\u{6211}\u{753b}\u{4e00}\u{5f20}",
-        "\u{5e2e}\u{6211}\u{753b}\u{5f20}",
-        "\u{5e2e}\u{6211}\u{753b}\u{4e2a}",
-        "\u{8bf7}\u{7ed9}\u{6211}\u{753b}",
-        "\u{8bf7}\u{5e2e}\u{6211}\u{753b}",
-        "\u{753b}\u{4e00}\u{5f20}",
-        "\u{753b}\u{5f20}",
-        "\u{753b}\u{4e2a}",
-        "\u{751f}\u{6210}\u{4e00}\u{5f20}\u{56fe}",
-        "\u{751f}\u{6210}\u{4e00}\u{5f20}\u{56fe}\u{7247}",
-        "\u{5e2e}\u{6211}\u{751f}\u{6210}\u{4e00}\u{5f20}",
-        "\u{7ed9}\u{6211}\u{751f}\u{6210}\u{4e00}\u{5f20}",
-        "\u{751f}\u{6210}\u{56fe}\u{7247}",
-        "\u{751f}\u{6210}\u{56fe}\u{50cf}",
-        "\u{5e2e}\u{6211}\u{751f}\u{56fe}",
-        "\u{7ed9}\u{6211}\u{751f}\u{56fe}",
-        "\u{8bf7}\u{751f}\u{56fe}",
-        "\u{751f}\u{4e00}\u{5f20}\u{56fe}",
-        "\u{505a}\u{4e00}\u{5f20}\u{56fe}",
-        "\u{5236}\u{4f5c}\u{4e00}\u{5f20}\u{56fe}",
-        "\u{7ed8}\u{5236}\u{4e00}\u{5f20}",
-    ];
-    chinese_intent.iter().any(|needle| prompt.contains(needle))
-}
-
-fn should_use_image_tool(state: &AppState, model: &str, prompt: &str) -> bool {
-    if !state.config.image_generation.is_enabled() {
-        return false;
-    }
-    let model = model.to_ascii_lowercase();
-    if model.contains("image") || model.contains("imagen") {
-        return true;
-    }
-    let latest_user_prompt = image_tool_prompt(prompt);
-    explicit_image_generation_prompt(&latest_user_prompt)
 }
 
 fn trace_id_from_headers(headers: &HeaderMap) -> String {
@@ -1182,8 +1087,15 @@ async fn chat_completions(
     let created = Utc::now().timestamp();
     let start = started();
     let trace_id = trace_id_from_headers(&headers);
-    let image_tool = should_use_image_tool(&state, &model_name, &latest_user_text);
-    let use_worker_vision = !input.attachments.is_empty() && vision_worker_enabled(&state);
+    let route = choose_generation_route(RouteRequest {
+        image_generation_enabled: state.config.image_generation.is_enabled(),
+        vision_worker_enabled: vision_worker_enabled(&state),
+        has_attachments: !input.attachments.is_empty(),
+        model: &model_name,
+        latest_user_text: &latest_user_text,
+    });
+    let image_tool = route == GenerationRoute::ImageTool;
+    let use_worker_vision = route == GenerationRoute::VisionWorker;
     tracing::info!(
         trace_id = %trace_id,
         model = %model_name,
@@ -1866,8 +1778,15 @@ async fn create_response(
     let response_id = format!("resp_{}", Uuid::new_v4());
     let created = Utc::now().timestamp();
     let start = started();
-    let image_tool = should_use_image_tool(&state, &request.model, &prompt);
-    let use_worker_vision = !input.attachments.is_empty() && vision_worker_enabled(&state);
+    let route = choose_generation_route(RouteRequest {
+        image_generation_enabled: state.config.image_generation.is_enabled(),
+        vision_worker_enabled: vision_worker_enabled(&state),
+        has_attachments: !input.attachments.is_empty(),
+        model: &request.model,
+        latest_user_text: &prompt,
+    });
+    let image_tool = route == GenerationRoute::ImageTool;
+    let use_worker_vision = route == GenerationRoute::VisionWorker;
     let output = if image_tool {
         match generate_image_tool_output(&state, &headers, &prompt).await {
             Ok(output_text) => {
@@ -2121,58 +2040,10 @@ impl IntoResponse for ApiError {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        append_text_only_image_guard, explicit_image_generation_prompt, image_tool_prompt,
-        warm_generate_active_at,
-    };
+    use super::{append_text_only_image_guard, warm_generate_active_at};
 
     fn periods(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_string()).collect()
-    }
-
-    #[test]
-    fn image_tool_prompt_uses_last_user_chatml_block() {
-        let prompt = "<|im_start|>system\nold rules\n<|im_end|>\n<|im_start|>user\n\u{5148}\u{804a}\u{70b9}\u{522b}\u{7684}\n<|im_end|>\n<|im_start|>assistant\nok\n<|im_end|>\n<|im_start|>user\n\u{5e2e}\u{6211}\u{753b}\u{4e00}\u{5f20}\u{732b}\u{56fe}\n<|im_end|>\n<|im_start|>assistant";
-        assert_eq!(
-            image_tool_prompt(prompt),
-            "\u{5e2e}\u{6211}\u{753b}\u{4e00}\u{5f20}\u{732b}\u{56fe}"
-        );
-
-        let prompt_with_old_image_request = "<|im_start|>user\n\u{7ed9}\u{6211}\u{753b}\u{4e00}\u{5f20}\u{7ea2}\u{8272}\u{5706}\u{5f62}\u{56fe}\u{6807}\n<|im_end|>\n<|im_start|>assistant\nok\n<|im_end|>\n<|im_start|>user\n\u{751f}\u{56fe}\u{8fd8}\u{6709}\u{62a5}\u{9519}\u{ff0c}\u{770b}\u{770b}\u{600e}\u{4e48}\u{529e}\n<|im_end|>\n<|im_start|>assistant";
-        let latest = image_tool_prompt(prompt_with_old_image_request);
-        assert_eq!(
-            latest,
-            "\u{751f}\u{56fe}\u{8fd8}\u{6709}\u{62a5}\u{9519}\u{ff0c}\u{770b}\u{770b}\u{600e}\u{4e48}\u{529e}"
-        );
-        assert!(!explicit_image_generation_prompt(&latest));
-    }
-
-    #[test]
-    fn explicit_image_generation_prompt_is_strict() {
-        assert!(explicit_image_generation_prompt(
-            "\u{7ed9}\u{6211}\u{753b}\u{4e00}\u{5f20}\u{7ea2}\u{8272}\u{5706}\u{5f62}\u{56fe}\u{6807}"
-        ));
-        assert!(explicit_image_generation_prompt(
-            "\u{5e2e}\u{6211}\u{751f}\u{6210}\u{4e00}\u{5f20}\u{767d}\u{5e95}\u{732b}\u{56fe}"
-        ));
-        assert!(explicit_image_generation_prompt(
-            "create an image of a red circle"
-        ));
-        assert!(!explicit_image_generation_prompt(
-            "\u{56fe}\u{91cc}\u{5199}\u{4e86}\u{4ec0}\u{4e48}\u{ff1f}"
-        ));
-        assert!(!explicit_image_generation_prompt(
-            "\u{5e2e}\u{6211}\u{770b}\u{770b}\u{8fd9}\u{5f20}\u{56fe}\u{7247}"
-        ));
-        assert!(!explicit_image_generation_prompt(
-            "\u{8fd9}\u{4e2a}\u{9875}\u{9762}\u{753b}\u{9762}\u{5f88}\u{602a}"
-        ));
-        assert!(!explicit_image_generation_prompt(
-            "\u{4e0d}\u{8981}\u{753b}\u{56fe}\u{ff0c}\u{7ed9}\u{6211}\u{6587}\u{5b57}\u{65b9}\u{6848}"
-        ));
-        assert!(!explicit_image_generation_prompt(
-            "\u{751f}\u{56fe}\u{8fd8}\u{6709}\u{62a5}\u{9519}\u{ff0c}\u{770b}\u{770b}\u{600e}\u{4e48}\u{529e}"
-        ));
     }
 
     #[test]
