@@ -1,6 +1,6 @@
 # Nanobot Gemini-FastAPI 迭代记录
 
-这份文档记录 `PainKiller0x0/Gemini-FastAPI` fork 相对上游的主要改动。它的定位是 nanobot/OBP 的 Gemini Web sidecar，不是把上游 Python 项目改成另一个大而全平台。
+这份文档记录 `PainKiller0x0/Gemini-FastAPI` fork 相对上游的主要改动。它的定位是 nanobot/OBP 的 Gemini Web sidecar，不是把上游 Python 项目改成另一个大而全平台。架构边界和后续拆分原则见 [docs/ARCHITECTURE.md](ARCHITECTURE.md)。
 
 ## 目标
 

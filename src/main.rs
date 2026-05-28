@@ -872,16 +872,16 @@ async fn image_generations(
 
     match result {
         Ok(data) => {
-            state.history.append(&HistoryRecord {
-                ts: timestamp(),
-                kind: "images.generations",
-                model: &model,
-                prompt_chars: request.prompt.chars().count(),
-                output_chars: data.len(),
-                latency_ms: start.elapsed().as_millis(),
-                ok: true,
-                error: None,
-            });
+            record_history(
+                &state,
+                "images.generations",
+                &model,
+                request.prompt.chars().count(),
+                data.len(),
+                &start,
+                true,
+                None,
+            );
             Ok(Json(ImageGenerationResponse {
                 created: Utc::now().timestamp(),
                 data,
@@ -890,16 +890,16 @@ async fn image_generations(
         }
         Err(error) => {
             let detail = error.detail.clone();
-            state.history.append(&HistoryRecord {
-                ts: timestamp(),
-                kind: "images.generations",
-                model: &model,
-                prompt_chars: request.prompt.chars().count(),
-                output_chars: 0,
-                latency_ms: start.elapsed().as_millis(),
-                ok: false,
-                error: Some(&detail),
-            });
+            record_history(
+                &state,
+                "images.generations",
+                &model,
+                request.prompt.chars().count(),
+                0,
+                &start,
+                false,
+                Some(&detail),
+            );
             Err(error)
         }
     }
@@ -1120,6 +1120,40 @@ fn trace_id_from_headers(headers: &HeaderMap) -> String {
         .to_string()
 }
 
+fn record_history(
+    state: &AppState,
+    kind: &str,
+    model: &str,
+    prompt_chars: usize,
+    output_chars: usize,
+    start: &std::time::Instant,
+    ok: bool,
+    error: Option<&str>,
+) {
+    state.history.append(&HistoryRecord {
+        ts: timestamp(),
+        kind,
+        model,
+        prompt_chars,
+        output_chars,
+        latency_ms: start.elapsed().as_millis(),
+        ok,
+        error,
+    });
+}
+
+fn usage_for(prompt: &str, storage_text: &str) -> Usage {
+    let prompt_tokens = estimate_tokens(prompt);
+    let completion_tokens = estimate_tokens(storage_text);
+    Usage {
+        prompt_tokens,
+        completion_tokens,
+        total_tokens: prompt_tokens + completion_tokens,
+        prompt_tokens_details: Some(json!({"cached_tokens": 0})),
+        completion_tokens_details: Some(json!({"reasoning_tokens": 0})),
+    }
+}
+
 async fn chat_completions(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -1195,30 +1229,48 @@ async fn chat_completions(
                     result = &mut vision_job => {
                         match result {
                             Ok(output) => {
-                                state_for_stream.history.append(&HistoryRecord {
-                                    ts: timestamp(),
-                                    kind: "chat.completions.vision_worker",
-                                    model: &model_for_stream,
-                                    prompt_chars: prompt_for_stream.chars().count(),
-                                    output_chars: output.text.chars().count(),
-                                    latency_ms: start.elapsed().as_millis(),
-                                    ok: true,
-                                    error: None,
-                                });
+                                record_history(
+
+                                    &state_for_stream,
+
+                                    "chat.completions.vision_worker",
+
+                                    &model_for_stream,
+
+                                    prompt_for_stream.chars().count(),
+
+                                    output.text.chars().count(),
+
+                                    &start,
+
+                                    true,
+
+                                    None,
+
+                                );
                                 break output.text;
                             }
                             Err(error) => {
                                 let detail = error.to_string();
-                                state_for_stream.history.append(&HistoryRecord {
-                                    ts: timestamp(),
-                                    kind: "chat.completions.vision_worker",
-                                    model: &model_for_stream,
-                                    prompt_chars: prompt_for_stream.chars().count(),
-                                    output_chars: 0,
-                                    latency_ms: start.elapsed().as_millis(),
-                                    ok: false,
-                                    error: Some(&detail),
-                                });
+                                record_history(
+
+                                    &state_for_stream,
+
+                                    "chat.completions.vision_worker",
+
+                                    &model_for_stream,
+
+                                    prompt_for_stream.chars().count(),
+
+                                    0,
+
+                                    &start,
+
+                                    false,
+
+                                    Some(&detail),
+
+                                );
                                 break format!("Gemini vision worker failed: {detail}");
                             }
                         }
@@ -1245,8 +1297,6 @@ async fn chat_completions(
                 };
                 yield Ok(Event::default().data(serde_json::to_string(&content).unwrap()));
             }
-            let prompt_tokens = estimate_tokens(&prompt_for_stream);
-            let completion_tokens = estimate_tokens(&processed.storage_text);
             let done = StreamChunk {
                 id,
                 object: "chat.completion.chunk",
@@ -1257,13 +1307,7 @@ async fn chat_completions(
                     delta: json!({}),
                     finish_reason: Some(processed.finish_reason),
                 }],
-                usage: Some(Usage {
-                    prompt_tokens,
-                    completion_tokens,
-                    total_tokens: prompt_tokens + completion_tokens,
-                    prompt_tokens_details: Some(json!({"cached_tokens": 0})),
-                    completion_tokens_details: Some(json!({"reasoning_tokens": 0})),
-                }),
+                usage: Some(usage_for(&prompt_for_stream, &processed.storage_text)),
             };
             yield Ok(Event::default().data(serde_json::to_string(&done).unwrap()));
             yield Ok(Event::default().data("[DONE]"));
@@ -1295,30 +1339,48 @@ async fn chat_completions(
             let image_job = async {
                 match generate_image_tool_output(&state_for_stream, &headers_for_stream, &image_prompt_for_stream).await {
                     Ok(output_text) => {
-                        state_for_stream.history.append(&HistoryRecord {
-                            ts: timestamp(),
-                            kind: "chat.completions.image_tool",
-                            model: &model_for_stream,
-                            prompt_chars: image_prompt_for_stream.chars().count(),
-                            output_chars: output_text.chars().count(),
-                            latency_ms: start.elapsed().as_millis(),
-                            ok: true,
-                            error: None,
-                        });
+                        record_history(
+
+                            &state_for_stream,
+
+                            "chat.completions.image_tool",
+
+                            &model_for_stream,
+
+                            image_prompt_for_stream.chars().count(),
+
+                            output_text.chars().count(),
+
+                            &start,
+
+                            true,
+
+                            None,
+
+                        );
                         output_text
                     }
                     Err(error) => {
                         let detail = error.detail;
-                        state_for_stream.history.append(&HistoryRecord {
-                            ts: timestamp(),
-                            kind: "chat.completions.image_tool",
-                            model: &model_for_stream,
-                            prompt_chars: image_prompt_for_stream.chars().count(),
-                            output_chars: 0,
-                            latency_ms: start.elapsed().as_millis(),
-                            ok: false,
-                            error: Some(&detail),
-                        });
+                        record_history(
+
+                            &state_for_stream,
+
+                            "chat.completions.image_tool",
+
+                            &model_for_stream,
+
+                            image_prompt_for_stream.chars().count(),
+
+                            0,
+
+                            &start,
+
+                            false,
+
+                            Some(&detail),
+
+                        );
                         format!("Image generation failed: {detail}")
                     }
                 }
@@ -1354,8 +1416,6 @@ async fn chat_completions(
                 yield Ok(Event::default().data(serde_json::to_string(&content).unwrap()));
             }
 
-            let prompt_tokens = estimate_tokens(&prompt_for_stream);
-            let completion_tokens = estimate_tokens(&processed.storage_text);
             let done = StreamChunk {
                 id,
                 object: "chat.completion.chunk",
@@ -1366,13 +1426,7 @@ async fn chat_completions(
                     delta: json!({}),
                     finish_reason: Some(processed.finish_reason),
                 }],
-                usage: Some(Usage {
-                    prompt_tokens,
-                    completion_tokens,
-                    total_tokens: prompt_tokens + completion_tokens,
-                    prompt_tokens_details: Some(json!({"cached_tokens": 0})),
-                    completion_tokens_details: Some(json!({"reasoning_tokens": 0})),
-                }),
+                usage: Some(usage_for(&prompt_for_stream, &processed.storage_text)),
             };
             yield Ok(Event::default().data(serde_json::to_string(&done).unwrap()));
             yield Ok(Event::default().data("[DONE]"));
@@ -1468,45 +1522,72 @@ async fn chat_completions(
                 .await
                 {
                     Ok(output_text) => {
-                        state_for_stream.history.append(&HistoryRecord {
-                            ts: timestamp(),
-                            kind: "chat.completions",
-                            model: &model_for_stream,
-                            prompt_chars: prompt_for_stream.chars().count(),
-                            output_chars: output_text.chars().count(),
-                            latency_ms: start.elapsed().as_millis(),
-                            ok: true,
-                            error: None,
-                        });
+                        record_history(
+
+                            &state_for_stream,
+
+                            "chat.completions",
+
+                            &model_for_stream,
+
+                            prompt_for_stream.chars().count(),
+
+                            output_text.chars().count(),
+
+                            &start,
+
+                            true,
+
+                            None,
+
+                        );
                         (output_text, false)
                     }
                     Err(error) => {
                         let detail = error.detail;
-                        state_for_stream.history.append(&HistoryRecord {
-                            ts: timestamp(),
-                            kind: "chat.completions",
-                            model: &model_for_stream,
-                            prompt_chars: prompt_for_stream.chars().count(),
-                            output_chars: 0,
-                            latency_ms: start.elapsed().as_millis(),
-                            ok: false,
-                            error: Some(&detail),
-                        });
+                        record_history(
+
+                            &state_for_stream,
+
+                            "chat.completions",
+
+                            &model_for_stream,
+
+                            prompt_for_stream.chars().count(),
+
+                            0,
+
+                            &start,
+
+                            false,
+
+                            Some(&detail),
+
+                        );
                         (format!("Gemini response postprocess failed: {detail}"), true)
                     }
                 },
                 Err(error) => {
                     let detail = error.to_string();
-                    state_for_stream.history.append(&HistoryRecord {
-                        ts: timestamp(),
-                        kind: "chat.completions",
-                        model: &model_for_stream,
-                        prompt_chars: prompt_for_stream.chars().count(),
-                        output_chars: 0,
-                        latency_ms: start.elapsed().as_millis(),
-                        ok: false,
-                        error: Some(&detail),
-                    });
+                    record_history(
+
+                        &state_for_stream,
+
+                        "chat.completions",
+
+                        &model_for_stream,
+
+                        prompt_for_stream.chars().count(),
+
+                        0,
+
+                        &start,
+
+                        false,
+
+                        Some(&detail),
+
+                    );
                     (format!("Gemini request failed: {detail}"), true)
                 }
             };
@@ -1557,8 +1638,6 @@ async fn chat_completions(
                 yield Ok(Event::default().data(serde_json::to_string(&tools).unwrap()));
             }
 
-            let prompt_tokens = estimate_tokens(&prompt_for_stream);
-            let completion_tokens = estimate_tokens(&processed.storage_text);
             let done = StreamChunk {
                 id,
                 object: "chat.completion.chunk",
@@ -1569,13 +1648,7 @@ async fn chat_completions(
                     delta: json!({}),
                     finish_reason: Some(processed.finish_reason),
                 }],
-                usage: Some(Usage {
-                    prompt_tokens,
-                    completion_tokens,
-                    total_tokens: prompt_tokens + completion_tokens,
-                    prompt_tokens_details: Some(json!({"cached_tokens": 0})),
-                    completion_tokens_details: Some(json!({"reasoning_tokens": 0})),
-                }),
+                usage: Some(usage_for(&prompt_for_stream, &processed.storage_text)),
             };
             yield Ok(Event::default().data(serde_json::to_string(&done).unwrap()));
             yield Ok(Event::default().data("[DONE]"));
@@ -1586,30 +1659,30 @@ async fn chat_completions(
     let output = if image_tool {
         match generate_image_tool_output(&state, &headers, &latest_user_text).await {
             Ok(output_text) => {
-                state.history.append(&HistoryRecord {
-                    ts: timestamp(),
-                    kind: "chat.completions.image_tool",
-                    model: &model_name,
-                    prompt_chars: latest_user_text.chars().count(),
-                    output_chars: output_text.chars().count(),
-                    latency_ms: start.elapsed().as_millis(),
-                    ok: true,
-                    error: None,
-                });
+                record_history(
+                    &state,
+                    "chat.completions.image_tool",
+                    &model_name,
+                    latest_user_text.chars().count(),
+                    output_text.chars().count(),
+                    &start,
+                    true,
+                    None,
+                );
                 output_text
             }
             Err(error) => {
                 let detail = error.detail.clone();
-                state.history.append(&HistoryRecord {
-                    ts: timestamp(),
-                    kind: "chat.completions.image_tool",
-                    model: &model_name,
-                    prompt_chars: latest_user_text.chars().count(),
-                    output_chars: 0,
-                    latency_ms: start.elapsed().as_millis(),
-                    ok: false,
-                    error: Some(&detail),
-                });
+                record_history(
+                    &state,
+                    "chat.completions.image_tool",
+                    &model_name,
+                    latest_user_text.chars().count(),
+                    0,
+                    &start,
+                    false,
+                    Some(&detail),
+                );
                 image_tool_failure_message(&detail)
             }
         }
@@ -1626,56 +1699,47 @@ async fn chat_completions(
             Ok(output) => {
                 let output_text =
                     append_image_markdown(&state, &headers, output.text, &output.images).await?;
-                state.history.append(&HistoryRecord {
-                    ts: timestamp(),
-                    kind: if use_worker_vision {
+                record_history(
+                    &state,
+                    if use_worker_vision {
                         "chat.completions.vision_worker"
                     } else {
                         "chat.completions"
                     },
-                    model: &model_name,
-                    prompt_chars: prompt.chars().count(),
-                    output_chars: output_text.chars().count(),
-                    latency_ms: start.elapsed().as_millis(),
-                    ok: true,
-                    error: None,
-                });
+                    &model_name,
+                    prompt.chars().count(),
+                    output_text.chars().count(),
+                    &start,
+                    true,
+                    None,
+                );
                 output_text
             }
             Err(error) => {
                 let detail = error.to_string();
-                state.history.append(&HistoryRecord {
-                    ts: timestamp(),
-                    kind: if use_worker_vision {
+                record_history(
+                    &state,
+                    if use_worker_vision {
                         "chat.completions.vision_worker"
                     } else {
                         "chat.completions"
                     },
-                    model: &model_name,
-                    prompt_chars: prompt.chars().count(),
-                    output_chars: 0,
-                    latency_ms: start.elapsed().as_millis(),
-                    ok: false,
-                    error: Some(&detail),
-                });
+                    &model_name,
+                    prompt.chars().count(),
+                    0,
+                    &start,
+                    false,
+                    Some(&detail),
+                );
                 return Err(ApiError::from(error));
             }
         }
     };
 
     let processed = process_output(&output);
-    let prompt_tokens = estimate_tokens(&prompt);
-    let completion_tokens = estimate_tokens(&processed.storage_text);
-    let usage = Usage {
-        prompt_tokens,
-        completion_tokens,
-        total_tokens: prompt_tokens + completion_tokens,
-        prompt_tokens_details: Some(json!({"cached_tokens": 0})),
-        completion_tokens_details: Some(json!({"reasoning_tokens": 0})),
-    };
+    let usage = usage_for(&prompt, &processed.storage_text);
 
     if request.stream.unwrap_or(false) {
-        let prompt_tokens = estimate_tokens(&prompt);
         let id = completion_id.clone();
         let model = model_name.clone();
         let visible = processed.visible_text.clone().unwrap_or_default();
@@ -1746,13 +1810,7 @@ async fn chat_completions(
                     delta: json!({}),
                     finish_reason: Some(finish_reason),
                 }],
-                usage: Some(Usage {
-                    prompt_tokens,
-                    completion_tokens: estimate_tokens(&processed.storage_text),
-                    total_tokens: prompt_tokens + estimate_tokens(&processed.storage_text),
-                    prompt_tokens_details: Some(json!({"cached_tokens": 0})),
-                    completion_tokens_details: Some(json!({"reasoning_tokens": 0})),
-                }),
+                usage: Some(usage_for(&prompt, &processed.storage_text)),
             };
             yield Ok(Event::default().data(serde_json::to_string(&done).unwrap()));
             yield Ok(Event::default().data("[DONE]"));
@@ -1813,30 +1871,30 @@ async fn create_response(
     let output = if image_tool {
         match generate_image_tool_output(&state, &headers, &prompt).await {
             Ok(output_text) => {
-                state.history.append(&HistoryRecord {
-                    ts: timestamp(),
-                    kind: "responses.image_tool",
-                    model: &request.model,
-                    prompt_chars: prompt.chars().count(),
-                    output_chars: output_text.chars().count(),
-                    latency_ms: start.elapsed().as_millis(),
-                    ok: true,
-                    error: None,
-                });
+                record_history(
+                    &state,
+                    "responses.image_tool",
+                    &request.model,
+                    prompt.chars().count(),
+                    output_text.chars().count(),
+                    &start,
+                    true,
+                    None,
+                );
                 output_text
             }
             Err(error) => {
                 let detail = error.detail.clone();
-                state.history.append(&HistoryRecord {
-                    ts: timestamp(),
-                    kind: "responses.image_tool",
-                    model: &request.model,
-                    prompt_chars: prompt.chars().count(),
-                    output_chars: 0,
-                    latency_ms: start.elapsed().as_millis(),
-                    ok: false,
-                    error: Some(&detail),
-                });
+                record_history(
+                    &state,
+                    "responses.image_tool",
+                    &request.model,
+                    prompt.chars().count(),
+                    0,
+                    &start,
+                    false,
+                    Some(&detail),
+                );
                 return Err(error);
             }
         }
@@ -1853,38 +1911,38 @@ async fn create_response(
             Ok(output) => {
                 let output_text =
                     append_image_markdown(&state, &headers, output.text, &output.images).await?;
-                state.history.append(&HistoryRecord {
-                    ts: timestamp(),
-                    kind: if use_worker_vision {
+                record_history(
+                    &state,
+                    if use_worker_vision {
                         "responses.vision_worker"
                     } else {
                         "responses"
                     },
-                    model: &request.model,
-                    prompt_chars: prompt.chars().count(),
-                    output_chars: output_text.chars().count(),
-                    latency_ms: start.elapsed().as_millis(),
-                    ok: true,
-                    error: None,
-                });
+                    &request.model,
+                    prompt.chars().count(),
+                    output_text.chars().count(),
+                    &start,
+                    true,
+                    None,
+                );
                 output_text
             }
             Err(error) => {
                 let detail = error.to_string();
-                state.history.append(&HistoryRecord {
-                    ts: timestamp(),
-                    kind: if use_worker_vision {
+                record_history(
+                    &state,
+                    if use_worker_vision {
                         "responses.vision_worker"
                     } else {
                         "responses"
                     },
-                    model: &request.model,
-                    prompt_chars: prompt.chars().count(),
-                    output_chars: 0,
-                    latency_ms: start.elapsed().as_millis(),
-                    ok: false,
-                    error: Some(&detail),
-                });
+                    &request.model,
+                    prompt.chars().count(),
+                    0,
+                    &start,
+                    false,
+                    Some(&detail),
+                );
                 return Err(ApiError::from(error));
             }
         }
